@@ -163,4 +163,122 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
         photo_file = await update.message.photo[-1].get_file()
         photo_bytes = await photo_file.download_as_bytearray()
-        base64_image = base64.b64encode(photo_bytes
+        base64_image = base64.b64encode(photo_bytes).decode('utf-8')
+        caption = update.message.caption or "Что на этой картинке?"
+        user_text = f"[Фото] {caption}"
+        content.append({"type": "text", "text": caption})
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}})
+
+    elif update.message.voice:
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        voice_file = await update.message.voice.get_file()
+        file_path = f"voice_{user_id}.ogg"
+        await voice_file.download_to_drive(file_path)
+        
+        try:
+            with open(file_path, "rb") as audio_file:
+                transcript = client.audio.transcriptions.create(model="openai/whisper-1", file=audio_file)
+            user_text = transcript.text
+            if os.path.exists(file_path): os.remove(file_path)
+            await update.message.reply_text(f"🎤 _Распознано:_ {user_text}", parse_mode=ParseMode.MARKDOWN)
+            content.append({"type": "text", "text": user_text})
+        except Exception as e:
+            logger.error(f"Whisper Error: {e}")
+            await update.message.reply_text("❌ Ошибка распознавания голоса. Проверьте баланс.")
+            return
+
+    if not content: return
+
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    user_chats[user_id].append({"role": "user", "content": content})
+    
+    messages_for_api = []
+    for m in user_chats[user_id][-MAX_HISTORY_LENGTH:]:
+        if isinstance(m["content"], list):
+            text_val = next((item["text"] for item in m["content"] if item["type"] == "text"), "")
+            messages_for_api.append({"role": m["role"], "content": text_val})
+        else:
+            messages_for_api.append(m)
+    messages_for_api[-1]["content"] = content
+
+    answer = await get_ai_response(model_id, messages_for_api)
+    if not answer: answer = "⚠️ Ошибка связи с AI."
+
+    user_chats[user_id].append({"role": "assistant", "content": answer})
+    
+    if len(answer) > 4096:
+        for i in range(0, len(answer), 4096): await update.message.reply_text(answer[i:i+4096])
+    else:
+        await update.message.reply_text(answer, parse_mode=ParseMode.MARKDOWN)
+
+# ===== КНОПКИ И МЕНЮ =====
+
+async def show_models_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, query=None):
+    keyboard = []
+    keys = list(MODELS.keys())
+    for i in range(0, len(keys), 2):
+        row = [InlineKeyboardButton(MODELS[keys[i+j]], callback_data=f"model_{keys[i+j]}") for j in range(2) if i+j < len(keys)]
+        keyboard.append(row)
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu")])
+    text = "🎯 **Выберите текстовую модель:**\n_(Gemini и GPT-4o поддерживают фото)_"
+    if query: await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    await query.answer()
+
+    if query.data == "show_models":
+        await show_models_menu(update, context, query)
+    elif query.data == "gen_image_help":
+        await query.message.reply_text(
+            "🎨 **Как создать картинку бесплатно:**\n\n"
+            "Используйте команду `/image` и напишите описание.\n"
+            "Например:\n`/image логотип Meridian соус, минимализм, вектор`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    elif query.data == "clear_history":
+        user_chats[user_id] = []
+        await query.answer("🧹 История очищена")
+    elif query.data.startswith("model_"):
+        new_model = query.data.replace("model_", "")
+        context.user_data['model'] = new_model
+        await query.edit_message_text(f"✅ Установлена модель: **{MODELS[new_model]}**", parse_mode=ParseMode.MARKDOWN)
+    elif query.data == "back_to_menu":
+        await start(update, context)
+
+# ===== СЕРВЕРНАЯ ЧАСТЬ =====
+
+async def main():
+    app = Application.builder().token(TOKEN).build()
+    
+    # Регистрация команд
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("image", generate_image_command)) # Новая команда
+    app.add_handler(CallbackQueryHandler(button_callback))
+    # Обрабатываем текст, фото и голос
+    app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.VOICE, handle_all_messages))
+    
+    await app.bot.set_webhook(f"{URL}/telegram")
+    
+    async def telegram_webhook(request: Request) -> Response:
+        json_data = await request.json()
+        await app.update_queue.put(Update.de_json(json_data, app.bot))
+        return Response()
+    
+    starlette_app = Starlette(routes=[
+        Route("/telegram", telegram_webhook, methods=["POST"]),
+        Route("/healthcheck", lambda _: PlainTextResponse("ok"), methods=["GET"]),
+    ])
+    
+    import uvicorn
+    config = uvicorn.Config(app=starlette_app, host="0.0.0.0", port=PORT)
+    server = uvicorn.Server(config)
+    
+    async with app:
+        await app.start()
+        await server.serve()
+        await app.stop()
+
+if __name__ == "__main__":
+    asyncio.run(main())
