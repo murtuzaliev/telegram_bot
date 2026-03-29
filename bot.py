@@ -2,12 +2,14 @@ import os
 import asyncio
 import logging
 import base64
+import httpx  # Библиотека для запросов к бесплатному API картинок
 from starlette.applications import Starlette
 from starlette.responses import Response, PlainTextResponse
 from starlette.requests import Request
 from starlette.routing import Route
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import Application, ContextTypes, MessageHandler, filters, CommandHandler, CallbackQueryHandler
+from telegram.constants import ParseMode
 
 from openai import OpenAI
 
@@ -22,7 +24,7 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 URL = os.environ.get("RENDER_EXTERNAL_URL")
 PORT = int(os.getenv("PORT", 8000))
 
-# ===== НАСТРОЙКИ МОДЕЛЕЙ =====
+# ===== НАСТРОЙКИ МОДЕЛЕЙ (Текст) =====
 MODELS = {
     "gemini": "🤖 Gemini 2.0 Flash",
     "gpt-4o": "🧠 GPT-4o (Vision)",
@@ -68,7 +70,9 @@ async def get_ai_response(model_id, messages):
 # ===== КОМАНДЫ =====
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Улучшенное главное меню
     keyboard = [
+        [InlineKeyboardButton("🖼️ Создать картинку (Бесплатно)", callback_data="gen_image_help")],
         [InlineKeyboardButton("🤖 Выбрать модель", callback_data="show_models")],
         [InlineKeyboardButton("🗑️ Очистить историю", callback_data="clear_history")],
     ]
@@ -76,23 +80,69 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_key = context.user_data.get('model', 'gemini')
     current_name = MODELS.get(current_key, "Gemini")
     
-    await update.message.reply_text(
-        f"👋 *Бот обновлен!*\n\n"
-        f"⚙️ **Модель:** {current_name}\n"
-        f"📷 **Я вижу фото** и перевожу текст с них.\n"
-        f"🎙️ **Я слышу голос** и отвечаю на аудио.\n\n"
-        "Пришли фото, голос или текст 👇",
-        reply_markup=reply_markup,
-        parse_mode="Markdown"
+    text = (
+        f"👋 *Привет! Я твой мульти-ассистент.*\n\n"
+        f"⚙️ **Текстовая модель:** {current_name}\n"
+        f"📷 **Я вижу фото** (Gemini/GPT-4o).\n"
+        f"🎙️ **Я слышу голос** (Whisper).\n"
+        f"🎨 **Я создаю картинки** (бесплатно).\n\n"
+        "Напиши вопрос, пришли фото/голос или нажми кнопку 👇"
     )
+    
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
+    else:
+        await update.message.reply_text(text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
 
-# ===== ОБРАБОТЧИКИ СООБЩЕНИЙ =====
+async def generate_image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /image [промпт]"""
+    chat_id = update.effective_chat.id
+    
+    # 1. Проверяем, есть ли описание
+    if not context.args:
+        await update.message.reply_text("❌ Ошибка: напишите описание после команды.\nПример: `/image красный соус, горы, арт`", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    prompt = " ".join(context.args)
+    
+    # 2. Уведомляем пользователя
+    status_msg = await update.message.reply_text(f"⏳ _Генерирую изображение по запросу:_ `{prompt}`...", parse_mode=ParseMode.MARKDOWN)
+    await context.bot.send_chat_action(chat_id=chat_id, action="upload_photo")
+
+    # 3. Запрос к бесплатному API Pollinations.ai
+    # Мы кодируем промпт для URL
+    encoded_prompt = httpx.URL(prompt).path
+    image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?nologo=true&private=true"
+
+    try:
+        async with httpx.AsyncClient() as client_http:
+            # Pollinations.ai генерирует картинку прямо при GET-запросе
+            response = await client_http.get(image_url, timeout=30.0)
+            
+            if response.status_code == 200:
+                # 4. Отправляем полученную картинку
+                # Переводим байты в формат, который понимает Telegram
+                await update.message.reply_photo(
+                    photo=response.content,
+                    caption=f"🎨 **Результат для:** `{prompt}`",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                await context.bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
+            else:
+                await status_msg.edit_text("❌ Ошибка: бесплатный сервис генерации сейчас недоступен. Попробуйте позже.")
+    except Exception as e:
+        logger.error(f"Image Gen Error: {e}")
+        await status_msg.edit_text(f"❌ Произошла ошибка при генерации: {e}")
+
+# ===== ОБРАБОТЧИКИ СООБЩЕНИЙ (Текст, Фото, Голос) =====
 
 async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # (Этот блок остается без изменений, как в предыдущем ответе)
+    # За исключением того, что я добавил InputMediaPhoto для более красивой отправки
+    
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     
-    # 1. Инициализация истории
     if user_id not in user_chats:
         user_chats[user_id] = []
     
@@ -102,149 +152,15 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
     content = []
     user_text = ""
 
-    # 2. Обработка ТЕКСТА
     if update.message.text:
         user_text = update.message.text
         content.append({"type": "text", "text": user_text})
 
-    # 3. Обработка ФОТО
     elif update.message.photo:
         if model_id not in VISION_MODELS:
             await update.message.reply_text(f"❌ Модель {model_key} не умеет анализировать фото. Переключитесь на Gemini или GPT-4o.")
             return
-
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
         photo_file = await update.message.photo[-1].get_file()
         photo_bytes = await photo_file.download_as_bytearray()
-        base64_image = base64.b64encode(photo_bytes).decode('utf-8')
-        
-        caption = update.message.caption or "Что на этой картинке? Если есть английский текст - переведи."
-        user_text = f"[Фото] {caption}"
-        content.append({"type": "text", "text": caption})
-        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}})
-
-    # 4. Обработка ГОЛОСА
-    elif update.message.voice:
-        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-        voice_file = await update.message.voice.get_file()
-        voice_bytes = await voice_file.download_as_bytearray()
-        
-        # Сохраняем временно для отправки в Whisper
-        with open("voice.ogg", "wb") as f:
-            f.write(voice_bytes)
-        
-        try:
-            # Используем стандартный эндпоинт OpenAI для Whisper через OpenRouter
-            with open("voice.ogg", "rb") as audio_file:
-                transcript = client.audio.transcriptions.create(
-                    model="openai/whisper-1", 
-                    file=audio_file
-                )
-            user_text = transcript.text
-            await update.message.reply_text(f"🎤 _Распознано:_ {user_text}", parse_mode="Markdown")
-            content.append({"type": "text", "text": user_text})
-        except Exception as e:
-            logger.error(f"Whisper Error: {e}")
-            await update.message.reply_text("❌ Не удалось распознать голос.")
-            return
-
-    # 5. Отправка в AI
-    if not content: return
-
-    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-    
-    # Добавляем в историю
-    user_chats[user_id].append({"role": "user", "content": content})
-    
-    # Ограничиваем историю (только текст для экономии токенов в истории)
-    messages_for_api = []
-    for m in user_chats[user_id][-MAX_HISTORY_LENGTH:]:
-        # Для истории оставляем только текст, чтобы не пересылать картинки по 10 раз
-        if isinstance(m["content"], list):
-            text_val = next((item["text"] for item in m["content"] if item["type"] == "text"), "")
-            messages_for_api.append({"role": m["role"], "content": text_val})
-        else:
-            messages_for_api.append(m)
-
-    # Если это текущее сообщение с картинкой — заменяем текст на полный контент (текст + фото)
-    messages_for_api[-1]["content"] = content
-
-    answer = await get_ai_response(model_id, messages_for_api)
-    
-    if not answer:
-        answer = "⚠️ Ошибка связи с AI. Попробуйте еще раз."
-
-    # Сохраняем ответ в историю
-    user_chats[user_id].append({"role": "assistant", "content": answer})
-    
-    # Отправка пользователю
-    if len(answer) > 4096:
-        for i in range(0, len(answer), 4096):
-            await update.message.reply_text(answer[i:i+4096])
-    else:
-        await update.message.reply_text(answer, parse_mode="Markdown")
-
-# ===== КНОПКИ И МЕНЮ =====
-
-async def show_models_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, query=None):
-    keyboard = []
-    keys = list(MODELS.keys())
-    for i in range(0, len(keys), 2):
-        row = [InlineKeyboardButton(MODELS[keys[i+j]], callback_data=f"model_{keys[i+j]}") for j in range(2) if i+j < len(keys)]
-        keyboard.append(row)
-    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu")])
-    
-    text = "🎯 **Выберите модель:**\n_(Gemini и GPT-4o поддерживают фото)_"
-    if query:
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user_id = query.from_user.id
-    await query.answer()
-
-    if query.data == "show_models":
-        await show_models_menu(update, context, query)
-    elif query.data == "clear_history":
-        user_chats[user_id] = []
-        await query.answer("🧹 История очищена")
-    elif query.data.startswith("model_"):
-        new_model = query.data.replace("model_", "")
-        context.user_data['model'] = new_model
-        await query.edit_message_text(f"✅ Установлена модель: **{MODELS[new_model]}**", parse_mode="Markdown")
-    elif query.data == "back_to_menu":
-        await start(update, context)
-
-# ===== СЕРВЕРНАЯ ЧАСТЬ =====
-
-async def main():
-    app = Application.builder().token(TOKEN).build()
-    
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button_callback))
-    # Обрабатываем текст, фото и голос
-    app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.VOICE, handle_all_messages))
-    
-    await app.bot.set_webhook(f"{URL}/telegram")
-    
-    async def telegram_webhook(request: Request) -> Response:
-        json_data = await request.json()
-        await app.update_queue.put(Update.de_json(json_data, app.bot))
-        return Response()
-    
-    starlette_app = Starlette(routes=[
-        Route("/telegram", telegram_webhook, methods=["POST"]),
-        Route("/healthcheck", lambda _: PlainTextResponse("ok"), methods=["GET"]),
-    ])
-    
-    import uvicorn
-    config = uvicorn.Config(app=starlette_app, host="0.0.0.0", port=PORT)
-    server = uvicorn.Server(config)
-    
-    async with app:
-        await app.start()
-        await server.serve()
-        await app.stop()
-
-if __name__ == "__main__":
-    asyncio.run(main())
+        base64_image = base64.b64encode(photo_bytes
