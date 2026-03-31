@@ -18,7 +18,15 @@ from telegram.constants import ParseMode
 
 from openai import OpenAI
 from bs4 import BeautifulSoup
-from youtube_transcript_api import YouTubeTranscriptApi
+
+# Пытаемся импортировать YouTube библиотеку с обработкой ошибок
+try:
+    from youtube_transcript_api import YouTubeTranscriptApi
+    YT_API_AVAILABLE = True
+except ImportError:
+    YT_API_AVAILABLE = False
+    logger = logging.getLogger(__name__)
+    logger.warning("youtube-transcript-api not available")
 
 # Настройка логирования
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -151,7 +159,10 @@ async def get_ai_response(model_id, messages):
         return f"❌ Ошибка: {str(e)[:100]}"
 
 def extract_youtube_transcript(url: str) -> tuple:
-    """Извлечение субтитров из YouTube видео (совместимость с новой версией API)"""
+    """Извлечение субтитров из YouTube видео (исправленная версия)"""
+    if not YT_API_AVAILABLE:
+        return None, None
+    
     try:
         # Извлекаем ID видео из URL
         video_id = None
@@ -169,48 +180,27 @@ def extract_youtube_transcript(url: str) -> tuple:
         
         logger.info(f"Extracting transcript for video ID: {video_id}")
         
-        # НОВЫЙ СПОСОБ: создаем экземпляр API и используем метод list()
-        ytt_api = YouTubeTranscriptApi()
-        
-        # Получаем список всех доступных транскрипций
-        transcript_list = ytt_api.list(video_id)
-        
-        # Пробуем найти транскрипцию: сначала русские, потом английские
-        transcript = None
-        language = None
-        
-        # Список языков для поиска по приоритету
-        priority_languages = [
-            'ru', 'uk',           # Русский и украинский
-            'en',                 # Английский
-            'de', 'fr', 'es',     # Немецкий, французский, испанский
-        ]
-        
-        for lang in priority_languages:
+        # Используем статический метод для получения транскрипции
+        try:
+            # Пробуем получить русские субтитры
+            transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['ru', 'uk'])
+            language = "русский"
+        except:
             try:
-                transcript = transcript_list.find_transcript([lang])
-                language = lang
-                logger.info(f"Found transcript in language: {lang}")
-                break
+                # Пробуем получить английские субтитры
+                transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['en'])
+                language = "английский"
             except:
-                continue
+                try:
+                    # Пробуем получить любые доступные субтитры
+                    transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
+                    language = "неизвестный"
+                except Exception as e:
+                    logger.error(f"No transcripts available: {e}")
+                    return None, None
         
-        # Если не нашли по приоритетным языкам, берем первый доступный
-        if transcript is None:
-            available_transcripts = list(transcript_list)
-            if available_transcripts:
-                transcript = available_transcripts[0]
-                language = transcript.language
-                logger.info(f"Using fallback transcript language: {language}")
-            else:
-                logger.error(f"No transcripts available for video {video_id}")
-                return None, None
-        
-        # Получаем текст транскрипции
-        transcript_data = transcript.fetch(preserve_formatting=True)
-        
-        # Собираем текст в одну строку
-        text_parts = [entry['text'] for entry in transcript_data]
+        # Собираем текст
+        text_parts = [entry['text'] for entry in transcript_list]
         text = " ".join(text_parts)
         
         logger.info(f"Successfully extracted {len(text)} characters of transcript")
@@ -257,6 +247,15 @@ async def summarize_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url:
     
     if is_youtube:
         await status_msg.edit_text("🎬 *Обнаружено YouTube видео!*\nИзвлекаю субтитры...", parse_mode=ParseMode.MARKDOWN)
+        
+        if not YT_API_AVAILABLE:
+            await status_msg.edit_text(
+                "❌ *YouTube анализ временно недоступен*\n\n"
+                "Библиотека для работы с YouTube не установлена.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+            
         text, language = extract_youtube_transcript(url)
         source = "YouTube видео"
     else:
@@ -270,8 +269,10 @@ async def summarize_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url:
                 "Возможные причины:\n"
                 "• У видео нет субтитров\n"
                 "• Видео на недоступном языке\n"
-                "• Это короткое видео (Shorts) без субтитров\n\n"
-                "Попробуйте другое видео с субтитрами.",
+                "• Это короткое видео (Shorts) без субтитров\n"
+                "• Видео слишком длинное\n\n"
+                "💡 *Совет:* Попробуйте видео, у которого точно есть субтитры. "
+                "Например, официальные видео или лекции.",
                 parse_mode=ParseMode.MARKDOWN
             )
         else:
@@ -385,7 +386,8 @@ async def handle_menu_commands(update: Update, context: ContextTypes.DEFAULT_TYP
             "• YouTube видео (с субтитрами)\n"
             "• Веб-страницы\n"
             "• Статьи\n"
-            "• Новости"
+            "• Новости\n\n"
+            "💡 *Для YouTube:* выбирайте видео с субтитрами для лучшего результата."
         )
         return True
         
@@ -789,10 +791,4 @@ async def main():
         await app.update_queue.put(Update.de_json(json_data, app.bot))
         return Response()
     
-    starlette_app = Starlette(routes=[
-        Route("/telegram", telegram_webhook, methods=["POST"]),
-        Route("/healthcheck", lambda _: PlainTextResponse("ok"), methods=["GET"]),
-    ])
-    
-    import uvicorn
-    config = uvicorn.Config(app=starlette_app, host="0.0.0.0", port=PORT)
+    starlette
