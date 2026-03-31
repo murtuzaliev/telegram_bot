@@ -19,7 +19,6 @@ from telegram.constants import ParseMode
 from openai import OpenAI
 from bs4 import BeautifulSoup
 from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api.formatters import TextFormatter
 
 # Настройка логирования
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -152,7 +151,7 @@ async def get_ai_response(model_id, messages):
         return f"❌ Ошибка: {str(e)[:100]}"
 
 def extract_youtube_transcript(url: str) -> tuple:
-    """Извлечение субтитров из YouTube видео. Возвращает (текст, язык)"""
+    """Извлечение субтитров из YouTube видео (совместимость с новой версией API)"""
     try:
         # Извлекаем ID видео из URL
         video_id = None
@@ -165,33 +164,56 @@ def extract_youtube_transcript(url: str) -> tuple:
                 video_id = url.split("shorts/")[1].split("?")[0]
         
         if not video_id:
+            logger.error(f"Could not extract video ID from URL: {url}")
             return None, None
         
-        # Получаем список доступных транскрипций
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        logger.info(f"Extracting transcript for video ID: {video_id}")
         
-        # Пробуем получить русские субтитры
-        try:
-            transcript = transcript_list.find_transcript(['ru', 'uk'])
-            language = "русский"
-        except:
+        # НОВЫЙ СПОСОБ: создаем экземпляр API и используем метод list()
+        ytt_api = YouTubeTranscriptApi()
+        
+        # Получаем список всех доступных транскрипций
+        transcript_list = ytt_api.list(video_id)
+        
+        # Пробуем найти транскрипцию: сначала русские, потом английские
+        transcript = None
+        language = None
+        
+        # Список языков для поиска по приоритету
+        priority_languages = [
+            'ru', 'uk',           # Русский и украинский
+            'en',                 # Английский
+            'de', 'fr', 'es',     # Немецкий, французский, испанский
+        ]
+        
+        for lang in priority_languages:
             try:
-                transcript = transcript_list.find_transcript(['en'])
-                language = "английский"
+                transcript = transcript_list.find_transcript([lang])
+                language = lang
+                logger.info(f"Found transcript in language: {lang}")
+                break
             except:
-                # Если нет, берем любые доступные
-                available = transcript_list._transcripts
-                if available:
-                    transcript = list(available.values())[0]
-                    language = transcript.language
-                else:
-                    return None, None
+                continue
         
-        # Форматируем в текст
-        formatter = TextFormatter()
-        text = formatter.format_transcript(transcript.fetch())
+        # Если не нашли по приоритетным языкам, берем первый доступный
+        if transcript is None:
+            available_transcripts = list(transcript_list)
+            if available_transcripts:
+                transcript = available_transcripts[0]
+                language = transcript.language
+                logger.info(f"Using fallback transcript language: {language}")
+            else:
+                logger.error(f"No transcripts available for video {video_id}")
+                return None, None
         
-        # Ограничиваем длину
+        # Получаем текст транскрипции
+        transcript_data = transcript.fetch(preserve_formatting=True)
+        
+        # Собираем текст в одну строку
+        text_parts = [entry['text'] for entry in transcript_data]
+        text = " ".join(text_parts)
+        
+        logger.info(f"Successfully extracted {len(text)} characters of transcript")
         return text[:4000], language
         
     except Exception as e:
@@ -265,8 +287,9 @@ async def summarize_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url:
     
     # Разный промпт для YouTube и обычных ссылок
     if is_youtube:
+        lang_text = f" на {language} языке" if language else ""
         prompt = f"""
-        Это транскрипция (субтитры) YouTube видео на {language} языке.
+        Это транскрипция (субтитры) YouTube видео{lang_text}.
         
         Сделай краткое содержание видео:
         1. О чем видео (основная тема)
@@ -773,12 +796,3 @@ async def main():
     
     import uvicorn
     config = uvicorn.Config(app=starlette_app, host="0.0.0.0", port=PORT)
-    server = uvicorn.Server(config)
-    
-    async with app:
-        await app.start()
-        await server.serve()
-        await app.stop()
-
-if __name__ == "__main__":
-    asyncio.run(main())
