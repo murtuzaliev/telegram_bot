@@ -5,13 +5,14 @@ import base64
 import urllib.parse
 import time
 import re
+import random
 from collections import defaultdict
 import httpx
 from starlette.applications import Starlette
 from starlette.responses import Response, PlainTextResponse
 from starlette.requests import Request
 from starlette.routing import Route
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, ContextTypes, MessageHandler, filters, CommandHandler, CallbackQueryHandler
 from telegram.constants import ParseMode
 
@@ -54,7 +55,7 @@ MODEL_IDS = {
     "deepseek": "deepseek/deepseek-chat",
 }
 
-# Расширенная информация о моделях для меню
+# Расширенная информация о моделях
 MODELS_INFO = {
     "gemini": {"icon": "🤖", "name": "Gemini 2.0 Flash", "desc": "Быстрая, умная, бесплатно", "vision": True},
     "gpt-4o": {"icon": "🧠", "name": "GPT-4o", "desc": "Видит фото, мощная", "vision": True},
@@ -69,57 +70,65 @@ VISION_MODELS = ["google/gemini-2.0-flash-001", "openai/gpt-4o", "openai/gpt-4o-
 
 # ===== СИСТЕМА ЛИЧНОСТЕЙ =====
 PERSONAS = {
-    "default": {
-        "name": "🤖 Ассистент",
-        "icon": "🤖",
-        "prompt": "Ты полезный и дружелюбный ассистент. Отвечай кратко и по делу."
-    },
-    "coder": {
-        "name": "💻 Python Разработчик",
-        "icon": "💻",
-        "prompt": "Ты Senior Python разработчик с 10-летним опытом. Отвечай с примерами кода, объясняй решения, используй best practices."
-    },
-    "translator": {
-        "name": "🌍 Профессиональный переводчик",
-        "icon": "🌍",
-        "prompt": "Ты профессиональный переводчик. Переводи всё на русский язык, сохраняя стиль и смысл. Если нужно, объясняй нюансы перевода."
-    },
-    "teacher": {
-        "name": "📚 Учитель английского",
-        "icon": "📚",
-        "prompt": "Ты опытный учитель английского языка. Исправляй ошибки ученика, объясняй грамматику, предлагай альтернативные варианты."
-    },
-    "writer": {
-        "name": "✍️ Креативный копирайтер",
-        "icon": "✍️",
-        "prompt": "Ты креативный копирайтер. Пиши увлекательно, используй метафоры, создавай запоминающиеся тексты."
-    },
-    "psychologist": {
-        "name": "🎭 Коуч-психолог",
-        "icon": "🎭",
-        "prompt": "Ты поддерживающий психолог и коуч. Задавай уточняющие вопросы, помогай рефлексировать, не давай готовых решений, а веди к ним."
-    },
-    "smm": {
-        "name": "📱 SMM-менеджер",
-        "icon": "📱",
-        "prompt": "Ты эксперт по SMM. Генерируй идеи для постов, предлагай форматы контента, пиши вовлекающие тексты."
-    },
-    "analyst": {
-        "name": "📊 Бизнес-аналитик",
-        "icon": "📊",
-        "prompt": "Ты бизнес-аналитик. Структурируй информацию, делай выводы, предлагай метрики для оценки."
-    }
+    "default": {"name": "🤖 Ассистент", "icon": "🤖", "prompt": "Ты полезный и дружелюбный ассистент. Отвечай кратко и по делу."},
+    "coder": {"name": "💻 Python Dev", "icon": "💻", "prompt": "Ты Senior Python разработчик. Отвечай с примерами кода, объясняй решения."},
+    "translator": {"name": "🌍 Переводчик", "icon": "🌍", "prompt": "Ты профессиональный переводчик. Переводи всё на русский язык."},
+    "teacher": {"name": "📚 Учитель", "icon": "📚", "prompt": "Ты учитель английского. Исправляй ошибки, объясняй грамматику."},
+    "writer": {"name": "✍️ Копирайтер", "icon": "✍️", "prompt": "Ты креативный копирайтер. Пиши увлекательно, используй метафоры."},
+    "psychologist": {"name": "🎭 Психолог", "icon": "🎭", "prompt": "Ты поддерживающий психолог. Задавай уточняющие вопросы, помогай рефлексировать."},
+    "smm": {"name": "📱 SMM", "icon": "📱", "prompt": "Ты эксперт по SMM. Генерируй идеи для постов, пиши вовлекающие тексты."},
+    "analyst": {"name": "📊 Аналитик", "icon": "📊", "prompt": "Ты бизнес-аналитик. Структурируй информацию, делай выводы."}
 }
 
-# Инициализация клиента
-client = OpenAI(api_key=OPENROUTER_API_KEY, base_url=OPENROUTER_BASE_URL)
+# Групповой режим: настройки
+GROUP_CONFIG = {
+    "enabled": True,
+    "spontaneous_chance": 12,
+    "max_context_messages": 8,
+    "min_message_length": 30,
+}
 
 # Хранилища
 user_chats = {}
 user_last_message = defaultdict(float)
 user_persona = {}
-user_voice_enabled = defaultdict(bool)
+group_messages = defaultdict(list)
 MAX_HISTORY_LENGTH = 10
+
+# Инициализация клиента
+client = OpenAI(api_key=OPENROUTER_API_KEY, base_url=OPENROUTER_BASE_URL)
+
+# ===== МЕНЮ (REPLY KEYBOARD) =====
+
+def get_main_menu() -> ReplyKeyboardMarkup:
+    """Главное меню (всегда внизу)"""
+    keyboard = [
+        ["🤖 Модели", "🎭 Личности"],
+        ["🎨 Картинка", "🔗 Анализ ссылки"],
+        ["🗑️ Очистить", "ℹ️ Помощь"]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
+
+def get_models_menu() -> ReplyKeyboardMarkup:
+    """Меню выбора моделей"""
+    keyboard = [
+        ["🤖 Gemini", "🧠 GPT-4o"],
+        ["🎭 Claude", "💚 GPT-4o Mini"],
+        ["🦙 Llama", "🐋 DeepSeek"],
+        ["🔙 Назад"]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
+
+def get_personas_menu() -> ReplyKeyboardMarkup:
+    """Меню выбора личностей"""
+    keyboard = [
+        ["🤖 Ассистент", "💻 Python Dev"],
+        ["🌍 Переводчик", "📚 Учитель"],
+        ["✍️ Копирайтер", "🎭 Психолог"],
+        ["📱 SMM", "📊 Аналитик"],
+        ["🔙 Назад"]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
 
 # ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====
 
@@ -135,42 +144,10 @@ async def get_ai_response(model_id, messages):
         )
         return response.choices[0].message.content
     except httpx.TimeoutException:
-        logger.error("Timeout ошибка")
-        return "⏰ Превышено время ожидания ответа от AI. Попробуйте позже."
+        return "⏰ Превышено время ожидания. Попробуйте позже."
     except Exception as e:
         logger.error(f"Ошибка API: {e}")
         return f"❌ Ошибка: {str(e)[:100]}"
-
-async def text_to_speech(text, voice="alloy"):
-    """Преобразование текста в голосовое сообщение"""
-    try:
-        text = text[:4096]
-        response = await asyncio.to_thread(
-            client.audio.speech.create,
-            model="tts-1",
-            voice=voice,
-            input=text
-        )
-        return response.content
-    except Exception as e:
-        logger.error(f"TTS Error: {e}")
-        return None
-
-async def voice_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    """Отправить голосовой ответ"""
-    try:
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="record_voice")
-        audio_bytes = await text_to_speech(text)
-        if audio_bytes:
-            await update.message.reply_voice(
-                voice=audio_bytes,
-                caption="🎙️ *Голосовой ответ*",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return True
-    except Exception as e:
-        logger.error(f"Voice reply error: {e}")
-    return False
 
 async def extract_text_from_url(url: str) -> str:
     """Извлечение текста из веб-страницы"""
@@ -205,14 +182,14 @@ async def summarize_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url:
     
     text = await extract_text_from_url(url)
     if not text:
-        await status_msg.edit_text("❌ Не удалось извлечь текст из ссылки. Проверьте, что ссылка открывается.")
+        await status_msg.edit_text("❌ Не удалось извлечь текст из ссылки.")
         return
     
     model_key = context.user_data.get('model', 'gemini')
     model_id = MODEL_IDS.get(model_key)
     
     prompt = f"""
-    Сделай краткую выжимку из следующего текста. Выдели главные мысли, ключевые факты и основные выводы.
+    Сделай краткую выжимку из текста. Выдели главные мысли и ключевые факты.
     
     Текст:
     {text}
@@ -225,9 +202,6 @@ async def summarize_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url:
     • [пункт 1]
     • [пункт 2]
     • [пункт 3]
-    
-    💡 *Выводы:*
-    [1-2 предложения]
     """
     
     await status_msg.edit_text("🤔 *Создаю краткое содержание...*", parse_mode=ParseMode.MARKDOWN)
@@ -238,49 +212,148 @@ async def summarize_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url:
         await status_msg.delete()
         await update.message.reply_text(answer, parse_mode=ParseMode.MARKDOWN)
     else:
-        await status_msg.edit_text("❌ Не удалось создать краткое содержание. Попробуйте позже.")
+        await status_msg.edit_text("❌ Не удалось создать краткое содержание.")
+
+# ===== ОБРАБОТЧИК МЕНЮ =====
+
+async def handle_menu_commands(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Обработка команд из постоянного меню"""
+    text = update.message.text
+    user_id = update.effective_user.id
+    
+    # Главное меню
+    if text == "🤖 Модели":
+        await update.message.reply_text(
+            "🎯 *Выберите модель:*\n\n"
+            "📷 *Vision* — видят фото\n"
+            "💎 *Бесплатные*: Gemini, Llama, DeepSeek",
+            reply_markup=get_models_menu(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return True
+        
+    elif text == "🎭 Личности":
+        await update.message.reply_text(
+            "🎭 *Выберите личность:*\n\n"
+            "Каждая личность меняет стиль общения и подход к ответам.",
+            reply_markup=get_personas_menu(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return True
+        
+    elif text == "🎨 Картинка":
+        await update.message.reply_text(
+            "🎨 *Создание картинки*\n\n"
+            "Просто напишите: `/image описание`\n\n"
+            "Примеры:\n"
+            "`/image кот в космосе`\n"
+            "`/image логотип минимализм`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return True
+        
+    elif text == "🔗 Анализ ссылки":
+        await update.message.reply_text(
+            "🔗 *Анализ ссылки*\n\n"
+            "Просто отправьте любую ссылку, и я сделаю краткое содержание!"
+        )
+        return True
+        
+    elif text == "🗑️ Очистить":
+        user_chats[user_id] = []
+        await update.message.reply_text(
+            "🧹 *История диалога очищена!*",
+            reply_markup=get_main_menu(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return True
+        
+    elif text == "ℹ️ Помощь":
+        await help_command(update, context)
+        return True
+        
+    elif text == "🔙 Назад":
+        await update.message.reply_text(
+            "👋 *Главное меню*",
+            reply_markup=get_main_menu(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return True
+    
+    # Выбор моделей
+    model_map = {
+        "🤖 Gemini": "gemini",
+        "🧠 GPT-4o": "gpt-4o",
+        "🎭 Claude": "claude",
+        "💚 GPT-4o Mini": "gpt-mini",
+        "🦙 Llama": "llama",
+        "🐋 DeepSeek": "deepseek"
+    }
+    if text in model_map:
+        model_key = model_map[text]
+        context.user_data['model'] = model_key
+        model_name = MODELS_INFO[model_key]["name"]
+        await update.message.reply_text(
+            f"✅ *Установлена модель:* {model_name}\n\n{MODELS_INFO[model_key]['desc']}",
+            reply_markup=get_main_menu(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return True
+    
+    # Выбор личностей
+    persona_map = {
+        "🤖 Ассистент": "default",
+        "💻 Python Dev": "coder",
+        "🌍 Переводчик": "translator",
+        "📚 Учитель": "teacher",
+        "✍️ Копирайтер": "writer",
+        "🎭 Психолог": "psychologist",
+        "📱 SMM": "smm",
+        "📊 Аналитик": "analyst"
+    }
+    if text in persona_map:
+        persona_key = persona_map[text]
+        user_persona[user_id] = persona_key
+        persona_name = PERSONAS[persona_key]["name"]
+        await update.message.reply_text(
+            f"✅ *Установлена личность:* {persona_name}",
+            reply_markup=get_main_menu(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return True
+    
+    return False
 
 # ===== КОМАНДЫ =====
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start"""
-    keyboard = [
-        [InlineKeyboardButton("🎨 Создать картинку", callback_data="gen_image_help")],
-        [InlineKeyboardButton("🤖 Выбрать модель", callback_data="show_models")],
-        [InlineKeyboardButton("🎭 Выбрать личность", callback_data="show_personas")],
-        [InlineKeyboardButton("🗑️ Очистить историю", callback_data="clear_history")],
-        [InlineKeyboardButton("🔊 Голосовые ответы", callback_data="toggle_voice")],
-        [InlineKeyboardButton("📊 О боте", callback_data="about_bot")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    current_key = context.user_data.get('model', 'gemini')
-    current_name = MODELS.get(current_key, "Gemini")
-    
     user_id = update.effective_user.id
+    
+    # Получаем текущие настройки
+    model_key = context.user_data.get('model', 'gemini')
+    current_model = MODELS_INFO[model_key]["name"]
     current_persona = user_persona.get(user_id, "default")
     persona_name = PERSONAS[current_persona]["name"]
-    voice_status = "включены" if user_voice_enabled[user_id] else "выключены"
     
-    text = (
-        f"👋 *Привет! Я твой мульти-ассистент.*\n\n"
-        f"⚙️ **Текстовая модель:** {current_name}\n"
-        f"🎭 **Личность:** {persona_name}\n"
-        f"🔊 **Голосовые ответы:** {voice_status}\n\n"
-        f"📷 **Я вижу фото** (Gemini/GPT-4o)\n"
-        f"🎙️ **Я слышу голос** (Whisper)\n"
-        f"🎨 **Я создаю картинки** (бесплатно)\n"
-        f"🔗 **Я анализирую ссылки** (отправь ссылку)\n\n"
-        "Напиши вопрос, пришли фото/голос/ссылку или нажми кнопку 👇"
+    await update.message.reply_text(
+        f"👋 *Привет! Я твой AI-ассистент!*\n\n"
+        f"⚙️ **Модель:** {current_model}\n"
+        f"🎭 **Личность:** {persona_name}\n\n"
+        f"Я умею:\n"
+        f"📝 Отвечать на вопросы\n"
+        f"🎨 Генерировать картинки\n"
+        f"🔗 Анализировать ссылки\n"
+        f"📷 Распознавать фото\n"
+        f"🎙️ Слышать голос\n\n"
+        f"👇 *Используй меню внизу для навигации!*",
+        reply_markup=get_main_menu(),
+        parse_mode=ParseMode.MARKDOWN
     )
-    
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
-    else:
-        await update.message.reply_text(text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /help"""
-    help_text = """
+    help_text = f"""
 📚 *Доступные команды:*
 
 /start - Главное меню
@@ -288,34 +361,26 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /image [описание] - Создать картинку
 
 *Как пользоваться:*
+• Используйте меню внизу для навигации
 • Просто отправьте текст - я отвечу
 • Отправьте фото с вопросом - я проанализирую
-• Отправьте голосовое сообщение - я распознаю и отвечу
+• Отправьте голосовое сообщение - я распознаю
 • Отправьте ссылку - я сделаю краткое содержание
-• Используйте /image для генерации картинок
 
-*Модели:*
-🤖 Gemini 2.0 Flash - быстрая, бесплатно
-🧠 GPT-4o - поддерживает фото
-🎭 Claude 3.5 Sonnet - креативная
-💚 GPT-4o Mini - экономичная
-🦙 Llama 3.3 - бесплатная
-🐋 DeepSeek V3 - мощная, бесплатно
-
-*Личности:*
-Можно выбрать разные стили общения: программист, переводчик, учитель, копирайтер, психолог, SMM-менеджер, аналитик
+*В группах:*
+• Упомяните меня @{context.bot.username} - я отвечу
+• Иногда я сам вступаю в разговор 🎭
     """
     await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
 
 async def generate_image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /image [промпт]"""
+    """Обработчик команды /image"""
     chat_id = update.effective_chat.id
     
     if not context.args:
         await update.message.reply_text(
             "❌ *Ошибка:* напишите описание после команды.\n\n"
-            "Пример:\n`/image красный соус, горы, арт`\n"
-            "`/image логотип Meridian, минимализм`",
+            "Пример:\n`/image красный закат над морем`\n`/image логотип минимализм`",
             parse_mode=ParseMode.MARKDOWN
         )
         return
@@ -323,13 +388,13 @@ async def generate_image_command(update: Update, context: ContextTypes.DEFAULT_T
     prompt = " ".join(context.args)
     
     status_msg = await update.message.reply_text(
-        f"⏳ *Генерирую изображение:* `{prompt}`...",
+        f"⏳ *Генерирую:* `{prompt}`...",
         parse_mode=ParseMode.MARKDOWN
     )
     await context.bot.send_chat_action(chat_id=chat_id, action="upload_photo")
 
     encoded_prompt = urllib.parse.quote(prompt)
-    image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?nologo=true&private=true&width=1024&height=1024"
+    image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?nologo=true&width=1024&height=1024"
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client_http:
@@ -338,33 +403,35 @@ async def generate_image_command(update: Update, context: ContextTypes.DEFAULT_T
             if response.status_code == 200:
                 await update.message.reply_photo(
                     photo=response.content,
-                    caption=f"🎨 *Результат для:* `{prompt}`",
+                    caption=f"🎨 *Результат:* `{prompt}`",
                     parse_mode=ParseMode.MARKDOWN
                 )
                 await context.bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
             else:
-                await status_msg.edit_text("❌ Бесплатный сервис генерации временно недоступен. Попробуйте позже.")
-    except httpx.TimeoutException:
-        await status_msg.edit_text("⏰ Превышено время ожидания. Попробуйте позже.")
+                await status_msg.edit_text("❌ Сервис генерации временно недоступен.")
     except Exception as e:
         logger.error(f"Image Gen Error: {e}")
-        await status_msg.edit_text(f"❌ Ошибка при генерации: {str(e)[:100]}")
+        await status_msg.edit_text(f"❌ Ошибка: {str(e)[:100]}")
 
-# ===== ОБРАБОТЧИКИ СООБЩЕНИЙ =====
+# ===== ОБРАБОТЧИК ЛИЧНЫХ СООБЩЕНИЙ =====
 
-async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка текста, фото, голоса и ссылок"""
+async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка личных сообщений"""
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
+    
+    # Сначала проверяем команды меню
+    if await handle_menu_commands(update, context):
+        return
     
     # Антиспам
     current_time = time.time()
     if current_time - user_last_message[user_id] < 1:
-        await update.message.reply_text("⏳ Пожалуйста, не спамьте! Подождите секунду.")
+        await update.message.reply_text("⏳ Подождите секунду...")
         return
     user_last_message[user_id] = current_time
     
-    # Проверяем, является ли сообщение ссылкой
+    # Проверяем ссылку
     if update.message.text and re.match(r'https?://[^\s]+', update.message.text):
         url_match = re.search(r'https?://[^\s]+', update.message.text)
         if url_match:
@@ -375,25 +442,24 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
     if user_id not in user_chats:
         user_chats[user_id] = []
     
-    # Получаем текущую модель и личность
+    # Получаем модель и личность
     model_key = context.user_data.get('model', 'gemini')
-    model_id = MODEL_IDS.get(model_key, "google/gemini-2.0-flash-001")
+    model_id = MODEL_IDS.get(model_key)
     persona_key = user_persona.get(user_id, "default")
     persona_prompt = PERSONAS[persona_key]["prompt"]
     
     content = []
-    user_text = ""
     
-    # Обработка разных типов сообщений
+    # Обработка текста
     if update.message.text:
-        user_text = update.message.text
-        content = [{"type": "text", "text": user_text}]
+        content = [{"type": "text", "text": update.message.text}]
         
+    # Обработка фото
     elif update.message.photo:
         if model_id not in VISION_MODELS:
             await update.message.reply_text(
-                f"❌ Модель {MODELS.get(model_key, model_key)} не умеет анализировать фото.\n"
-                "Переключитесь на Gemini или GPT-4o с помощью кнопки 'Выбрать модель'."
+                f"❌ Модель {MODELS_INFO[model_key]['name']} не умеет анализировать фото.\n"
+                "Выберите Gemini или GPT-4o в меню 'Модели'."
             )
             return
         
@@ -402,12 +468,12 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
         photo_bytes = await photo_file.download_as_bytearray()
         base64_image = base64.b64encode(photo_bytes).decode('utf-8')
         caption = update.message.caption or "Что на этой картинке?"
-        user_text = f"[Фото] {caption}"
         content = [
             {"type": "text", "text": caption},
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
         ]
         
+    # Обработка голоса
     elif update.message.voice:
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
         voice_file = await update.message.voice.get_file()
@@ -420,15 +486,14 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
                     model="whisper-1",
                     file=audio_file
                 )
-            user_text = transcript.text
             await update.message.reply_text(
-                f"🎤 *Распознано:* {user_text}",
+                f"🎤 *Распознано:* {transcript.text}",
                 parse_mode=ParseMode.MARKDOWN
             )
-            content = [{"type": "text", "text": user_text}]
+            content = [{"type": "text", "text": transcript.text}]
         except Exception as e:
             logger.error(f"Whisper Error: {e}")
-            await update.message.reply_text("❌ Ошибка распознавания голоса. Проверьте ключ API.")
+            await update.message.reply_text("❌ Ошибка распознавания голоса.")
             return
         finally:
             if os.path.exists(file_path):
@@ -439,12 +504,11 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
     
-    # Сохраняем сообщение пользователя
+    # Сохраняем историю
     user_chats[user_id].append({"role": "user", "content": content})
     
-    # Подготавливаем историю для API с системным промптом
+    # Подготавливаем запрос
     messages_for_api = [{"role": "system", "content": persona_prompt}]
-    
     for m in user_chats[user_id][-MAX_HISTORY_LENGTH:]:
         if isinstance(m["content"], list):
             text_parts = [item["text"] for item in m["content"] if item.get("type") == "text"]
@@ -461,226 +525,87 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not answer:
         answer = "⚠️ Ошибка связи с AI. Попробуйте позже."
     
-    # Сохраняем ответ
     user_chats[user_id].append({"role": "assistant", "content": answer})
     
-    # Отправляем текстовый ответ
+    # Отправляем ответ
     if len(answer) > 4096:
         for i in range(0, len(answer), 4096):
             await update.message.reply_text(answer[i:i+4096])
     else:
         await update.message.reply_text(answer, parse_mode=ParseMode.MARKDOWN)
-    
-    # Отправляем голосовой ответ, если включено
-    if user_voice_enabled[user_id]:
-        await voice_reply(update, context, answer)
 
-# ===== МЕНЮ И КНОПКИ =====
+# ===== ОБРАБОТЧИК ГРУППОВЫХ СООБЩЕНИЙ =====
 
-async def show_models_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, query=None):
-    """Показать меню выбора моделей с иконками и описаниями"""
-    keyboard = []
-    keys = list(MODELS_INFO.keys())
+async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка сообщений в группах"""
+    message = update.message
+    chat_id = message.chat_id
     
-    for i in range(0, len(keys), 2):
-        row = []
-        for j in range(2):
-            if i + j < len(keys):
-                key = keys[i + j]
-                info = MODELS_INFO[key]
-                vision_badge = " 📷" if info["vision"] else ""
-                button_text = f"{info['icon']} {info['name']}{vision_badge}"
-                row.append(InlineKeyboardButton(button_text, callback_data=f"model_{key}"))
-        if row:
-            keyboard.append(row)
+    if message.from_user and message.from_user.is_bot:
+        return
     
-    keyboard.append([InlineKeyboardButton("ℹ️ О моделях", callback_data="models_info")])
-    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu")])
+    # Сохраняем сообщение
+    user_name = message.from_user.first_name if message.from_user else "Пользователь"
+    text = message.text or message.caption or ""
     
-    text = (
-        "🎯 *Выберите текстовую модель*\n\n"
-        "📷 *Vision* — видят фото\n"
-        "💎 *Бесплатные*: Gemini, Llama, DeepSeek\n"
-        "✨ *GPT-4o и Claude* — премиум"
+    group_messages[chat_id].append({
+        "name": user_name,
+        "text": text,
+        "timestamp": time.time()
+    })
+    
+    if len(group_messages[chat_id]) > 50:
+        group_messages[chat_id] = group_messages[chat_id][-50:]
+    
+    # Проверяем, нужно ли отвечать
+    bot_username = (await context.bot.get_me()).username
+    should_reply = False
+    reply_type = "none"
+    
+    if message.text and f"@{bot_username}" in message.text:
+        should_reply = True
+        reply_type = "mention"
+    elif message.reply_to_message and message.reply_to_message.from_user and message.reply_to_message.from_user.is_bot:
+        if message.reply_to_message.from_user.username == bot_username:
+            should_reply = True
+            reply_type = "reply"
+    elif len(text) >= GROUP_CONFIG["min_message_length"] and random.randint(1, 100) <= GROUP_CONFIG["spontaneous_chance"]:
+        should_reply = True
+        reply_type = "spontaneous"
+    
+    if not should_reply:
+        return
+    
+    # Собираем контекст
+    context_lines = []
+    for msg in group_messages[chat_id][-GROUP_CONFIG["max_context_messages"]:]:
+        if msg["text"]:
+            context_lines.append(f"{msg['name']}: {msg['text']}")
+    
+    if not context_lines:
+        return
+    
+    context_text = "\n".join(context_lines)
+    
+    # Генерируем ответ
+    prompts = {
+        "mention": f"Ты участник чата. Тебя упомянули. Ответь весело, коротко (1-2 предложения). Контекст:\n{context_text}",
+        "reply": f"Ты отвечаешь на сообщение. Будь остроумным. Контекст:\n{context_text}",
+        "spontaneous": f"Ты активный участник чата. Напиши короткую шутку или комментарий (1-2 предложения). Контекст:\n{context_text}"
+    }
+    
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    
+    answer = await get_ai_response(
+        MODEL_IDS["llama"],
+        [{"role": "user", "content": prompts.get(reply_type, prompts["spontaneous"])}]
     )
     
-    if query:
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
-    else:
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
-
-async def models_info(update: Update, context: ContextTypes.DEFAULT_TYPE, query=None):
-    """Информация о моделях"""
-    info_text = """
-📊 *Сравнение моделей:*
-
-🤖 *Gemini 2.0 Flash*
-• Бесплатно
-• Быстрые ответы
-• Поддерживает фото
-
-🧠 *GPT-4o*
-• Платная (но мощная)
-• Лучшее понимание фото
-• Отличный код
-
-🎭 *Claude 3.5 Sonnet*
-• Платная
-• Креативные ответы
-• Длинный контекст
-
-💚 *GPT-4o Mini*
-• Дешевая
-• Быстрая
-• Хороша для простых задач
-
-🦙 *Llama 3.3*
-• Полностью бесплатно
-• Хороший баланс
-
-🐋 *DeepSeek V3*
-• Полностью бесплатно
-• Мощная, как GPT-4
-
-💡 *Совет:* Для фото используйте Gemini или GPT-4o
-    """
-    if query:
-        await query.message.reply_text(info_text, parse_mode=ParseMode.MARKDOWN)
-    else:
-        await update.message.reply_text(info_text, parse_mode=ParseMode.MARKDOWN)
-
-async def show_personas_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, query=None):
-    """Показать меню выбора личности"""
-    keyboard = []
-    keys = list(PERSONAS.keys())
+    if not answer:
+        jokes = ["😏 Интересно...", "🤔 Продолжайте!", "🍿 Наблюдаю..."]
+        answer = random.choice(jokes)
     
-    for i in range(0, len(keys), 2):
-        row = []
-        for j in range(2):
-            if i + j < len(keys):
-                key = keys[i + j]
-                info = PERSONAS[key]
-                row.append(InlineKeyboardButton(
-                    f"{info['icon']} {info['name']}",
-                    callback_data=f"persona_{key}"
-                ))
-        if row:
-            keyboard.append(row)
-    
-    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu")])
-    
-    user_id = update.effective_user.id if update.effective_user else query.from_user.id
-    current_persona = user_persona.get(user_id, "default")
-    current_name = PERSONAS[current_persona]["name"]
-    
-    text = (
-        f"🎭 *Выберите личность ИИ*\n\n"
-        f"Текущая: {current_name}\n\n"
-        f"Каждая личность меняет стиль общения и подход к ответам."
-    )
-    
-    if query:
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
-    else:
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
-
-async def toggle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE, query=None):
-    """Включить/выключить голосовые ответы"""
-    user_id = update.effective_user.id if update.effective_user else query.from_user.id
-    user_voice_enabled[user_id] = not user_voice_enabled[user_id]
-    status = "включены" if user_voice_enabled[user_id] else "выключены"
-    
-    text = f"🔊 *Голосовые ответы {status}!*"
-    if query:
-        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN)
-    else:
-        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
-async def about_bot(update: Update, context: ContextTypes.DEFAULT_TYPE, query=None):
-    """Информация о боте"""
-    about_text = """
-🤖 *О боте*
-
-Версия: 2.0
-Разработчик: @your_username
-
-*Возможности:*
-• 6 моделей ИИ (Gemini, GPT-4o, Claude и др.)
-• 8 личностей (программист, переводчик, учитель и др.)
-• Распознавание и генерация голоса
-• Анализ фото (Vision)
-• Генерация изображений
-• Анализ ссылок (суммаризация)
-• История диалога
-
-*Технологии:*
-• Python + python-telegram-bot
-• OpenRouter API
-• OpenAI Whisper & TTS
-• Pollinations.ai
-
-*Контакты:*
-По вопросам и предложениям пишите @your_username
-    """
-    if query:
-        await query.message.reply_text(about_text, parse_mode=ParseMode.MARKDOWN)
-    else:
-        await update.message.reply_text(about_text, parse_mode=ParseMode.MARKDOWN)
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка нажатий на кнопки"""
-    query = update.callback_query
-    user_id = query.from_user.id
-    await query.answer()
-    
-    if query.data == "show_models":
-        await show_models_menu(update, context, query)
-        
-    elif query.data == "models_info":
-        await models_info(update, context, query)
-        
-    elif query.data == "show_personas":
-        await show_personas_menu(update, context, query)
-        
-    elif query.data == "gen_image_help":
-        await query.message.reply_text(
-            "🎨 *Как создать картинку бесплатно:*\n\n"
-            "Используйте команду `/image` и напишите описание.\n\n"
-            "Примеры:\n"
-            "`/image логотип Meridian соус, минимализм, вектор`\n"
-            "`/image красный закат над морем, цифровой арт`\n\n"
-            "Картинки генерируются автоматически!",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        
-    elif query.data == "clear_history":
-        user_chats[user_id] = []
-        await query.edit_message_text("🧹 *История диалога очищена!*", parse_mode=ParseMode.MARKDOWN)
-        
-    elif query.data == "toggle_voice":
-        await toggle_voice(update, context, query)
-        
-    elif query.data == "about_bot":
-        await about_bot(update, context, query)
-        
-    elif query.data.startswith("model_"):
-        new_model = query.data.replace("model_", "")
-        context.user_data['model'] = new_model
-        text = f"✅ *Установлена модель:* **{MODELS_INFO[new_model]['name']}**\n\n{ MODELS_INFO[new_model]['desc'] }"
-        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN)
-        
-    elif query.data.startswith("persona_"):
-        persona_key = query.data.replace("persona_", "")
-        user_persona[user_id] = persona_key
-        persona_name = PERSONAS[persona_key]["name"]
-        await query.edit_message_text(
-            f"✅ *Установлена личность:* {persona_name}\n\n"
-            f"Теперь я буду общаться в этом стиле!",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        
-    elif query.data == "back_to_menu":
-        await start(update, context)
+    await message.reply_text(answer, parse_mode=ParseMode.MARKDOWN)
 
 # ===== СЕРВЕРНАЯ ЧАСТЬ =====
 
@@ -696,12 +621,23 @@ async def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("image", generate_image_command))
-    app.add_handler(CallbackQueryHandler(button_callback))
     
-    # Обрабатываем текст, фото и голос
+    # Обработчики сообщений
     app.add_handler(MessageHandler(
-        filters.TEXT | filters.PHOTO | filters.VOICE,
-        handle_all_messages
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+        handle_private_message
+    ))
+    app.add_handler(MessageHandler(
+        filters.PHOTO & filters.ChatType.PRIVATE,
+        handle_private_message
+    ))
+    app.add_handler(MessageHandler(
+        filters.VOICE & filters.ChatType.PRIVATE,
+        handle_private_message
+    ))
+    app.add_handler(MessageHandler(
+        filters.TEXT & filters.ChatType.GROUPS & filters.ChatType.SUPERGROUP,
+        handle_group_message
     ))
     
     # Установка webhook
@@ -709,10 +645,8 @@ async def main():
         webhook_url = f"{URL}/telegram"
         await app.bot.set_webhook(webhook_url)
         logger.info(f"Webhook установлен: {webhook_url}")
-    else:
-        logger.warning("RENDER_EXTERNAL_URL не установлен, webhook не будет работать!")
     
-    # Создаем Starlette приложение
+    # Starlette приложение
     async def telegram_webhook(request: Request) -> Response:
         json_data = await request.json()
         await app.update_queue.put(Update.de_json(json_data, app.bot))
