@@ -18,10 +18,19 @@ from telegram.constants import ParseMode
 
 from openai import OpenAI
 from bs4 import BeautifulSoup
-from youtube_transcript_api import YouTubeTranscriptApi
+
+# Пытаемся импортировать YouTube библиотеку
+try:
+    from youtube_transcript_api import YouTubeTranscriptApi
+    YT_API_AVAILABLE = True
+except ImportError:
+    YT_API_AVAILABLE = False
 
 # Настройка логирования
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
 # ===== ПЕРЕМЕННЫЕ =====
@@ -31,7 +40,22 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 URL = os.environ.get("RENDER_EXTERNAL_URL")
 PORT = int(os.getenv("PORT", 8000))
 
-# ===== НАСТРОЙКИ МОДЕЛЕЙ =====
+# Проверка наличия обязательных переменных
+if not TOKEN:
+    logger.error("TELEGRAM_TOKEN не установлен!")
+if not OPENROUTER_API_KEY:
+    logger.error("OPENROUTER_API_KEY не установлен!")
+
+# ===== НАСТРОЙКИ МОДЕЛЕЙ (Текст) =====
+MODELS = {
+    "gemini": "🤖 Gemini 2.0 Flash",
+    "gpt-4o": "🧠 GPT-4o (Vision)",
+    "claude": "🎭 Claude 3.5 Sonnet",
+    "gpt-mini": "💚 GPT-4o Mini",
+    "llama": "🦙 Llama 3.3 (Free)",
+    "deepseek": "🐋 DeepSeek V3",
+}
+
 MODEL_IDS = {
     "gemini": "google/gemini-2.0-flash-001",
     "gpt-4o": "openai/gpt-4o",
@@ -41,44 +65,107 @@ MODEL_IDS = {
     "deepseek": "deepseek/deepseek-chat",
 }
 
+# Расширенная информация о моделях
 MODELS_INFO = {
-    "gemini": {"icon": "🤖", "name": "Gemini 2.0 Flash", "desc": "Быстрая, умная, бесплатно"},
-    "gpt-4o": {"icon": "🧠", "name": "GPT-4o", "desc": "Видит фото, мощная"},
-    "claude": {"icon": "🎭", "name": "Claude 3.5 Sonnet", "desc": "Креативная"},
-    "gpt-mini": {"icon": "💚", "name": "GPT-4o Mini", "desc": "Экономичная"},
-    "llama": {"icon": "🦙", "name": "Llama 3.3", "desc": "Бесплатно"},
-    "deepseek": {"icon": "🐋", "name": "DeepSeek V3", "desc": "Мощная"},
+    "gemini": {"icon": "🤖", "name": "Gemini 2.0 Flash", "desc": "Быстрая, умная, бесплатно", "vision": True},
+    "gpt-4o": {"icon": "🧠", "name": "GPT-4o", "desc": "Видит фото, мощная", "vision": True},
+    "claude": {"icon": "🎭", "name": "Claude 3.5 Sonnet", "desc": "Креативная, длинные ответы", "vision": True},
+    "gpt-mini": {"icon": "💚", "name": "GPT-4o Mini", "desc": "Экономичная, быстрая", "vision": True},
+    "llama": {"icon": "🦙", "name": "Llama 3.3", "desc": "Совсем бесплатно", "vision": False},
+    "deepseek": {"icon": "🐋", "name": "DeepSeek V3", "desc": "Мощная, бесплатно", "vision": False},
 }
+
+# Список моделей, которые умеют работать с картинками
+VISION_MODELS = ["google/gemini-2.0-flash-001", "openai/gpt-4o", "openai/gpt-4o-mini", "anthropic/claude-3.5-sonnet"]
 
 # ===== СИСТЕМА ЛИЧНОСТЕЙ =====
 PERSONAS = {
-    "default": {"name": "🤖 Ассистент", "prompt": "Ты полезный ассистент. Отвечай кратко и по делу."},
-    "coder": {"name": "💻 Python Dev", "prompt": "Ты Senior Python разработчик. Давай код и объяснения для новичка."},
-    "translator": {"name": "🌍 Переводчик", "prompt": "Ты профессиональный переводчик. Переводи всё на русский."},
+    "default": {"name": "🤖 Ассистент", "icon": "🤖", "prompt": "Ты полезный и дружелюбный ассистент. Отвечай кратко и по делу."},
+    "coder": {"name": "💻 Python Dev", "icon": "💻", "prompt": "Ты Senior Python разработчик. Отвечай с примерами кода, объясняй решения."},
+    "translator": {"name": "🌍 Переводчик", "icon": "🌍", "prompt": "Ты профессиональный переводчик. Переводи всё на русский язык."},
+    "teacher": {"name": "📚 Учитель", "icon": "📚", "prompt": "Ты учитель английского. Исправляй ошибки, объясняй грамматику."},
+    "writer": {"name": "✍️ Копирайтер", "icon": "✍️", "prompt": "Ты креативный копирайтер. Пиши увлекательно, используй метафоры."},
+    "psychologist": {"name": "🎭 Психолог", "icon": "🎭", "prompt": "Ты поддерживающий психолог. Задавай уточняющие вопросы, помогай рефлексировать."},
+    "smm": {"name": "📱 SMM", "icon": "📱", "prompt": "Ты эксперт по SMM. Генерируй идеи для постов, пиши вовлекающие тексты."},
+    "analyst": {"name": "📊 Аналитик", "icon": "📊", "prompt": "Ты бизнес-аналитик. Структурируй информацию, делай выводы."}
+}
+
+# Групповой режим: настройки
+GROUP_CONFIG = {
+    "enabled": True,
+    "spontaneous_chance": 15,  # 15% шанс спонтанно ответить
+    "max_context_messages": 8,
+    "min_message_length": 20,  # Минимальная длина сообщения для спонтанного ответа
 }
 
 # Хранилища
 user_chats = {}
+user_last_message = defaultdict(float)
 user_persona = {}
+group_messages = defaultdict(list)
 MAX_HISTORY_LENGTH = 10
 
+# Инициализация клиента
 client = OpenAI(api_key=OPENROUTER_API_KEY, base_url=OPENROUTER_BASE_URL)
 
-# ===== МЕНЮ =====
+# ===== МЕНЮ (REPLY KEYBOARD) =====
 
-def get_main_menu():
+def get_main_menu() -> ReplyKeyboardMarkup:
+    """Главное меню (всегда внизу)"""
     keyboard = [
         ["🤖 Модели", "🎭 Личности"],
         ["🎨 Картинка", "🔗 Анализ ссылки"],
         ["🗑️ Очистить", "ℹ️ Помощь"]
     ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
 
-# ===== ФУНКЦИИ ИЗВЛЕЧЕНИЯ ДАННЫХ =====
+def get_models_menu() -> ReplyKeyboardMarkup:
+    """Меню выбора моделей"""
+    keyboard = [
+        ["🤖 Gemini", "🧠 GPT-4o"],
+        ["🎭 Claude", "💚 GPT-4o Mini"],
+        ["🦙 Llama", "🐋 DeepSeek"],
+        ["🔙 Назад"]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
+
+def get_personas_menu() -> ReplyKeyboardMarkup:
+    """Меню выбора личностей"""
+    keyboard = [
+        ["🤖 Ассистент", "💻 Python Dev"],
+        ["🌍 Переводчик", "📚 Учитель"],
+        ["✍️ Копирайтер", "🎭 Психолог"],
+        ["📱 SMM", "📊 Аналитик"],
+        ["🔙 Назад"]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
+
+# ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====
+
+async def get_ai_response(model_id, messages):
+    """Универсальная функция запроса к AI"""
+    try:
+        response = await asyncio.to_thread(
+            client.chat.completions.create,
+            model=model_id,
+            messages=messages,
+            max_tokens=1500,
+            timeout=30.0
+        )
+        return response.choices[0].message.content
+    except httpx.TimeoutException:
+        return "⏰ Превышено время ожидания. Попробуйте позже."
+    except Exception as e:
+        logger.error(f"Ошибка API: {e}")
+        return f"❌ Ошибка: {str(e)[:100]}"
 
 def extract_youtube_transcript(url: str) -> tuple:
-    """Извлечение субтитров с ПРИНУДИТЕЛЬНЫМ авто-переводом на русский"""
+    """Извлечение субтитров из YouTube видео"""
+    if not YT_API_AVAILABLE:
+        return None, None
+    
     try:
+        # Извлекаем ID видео из URL
         video_id = None
         if "youtu.be" in url:
             video_id = url.split("/")[-1].split("?")[0]
@@ -88,159 +175,623 @@ def extract_youtube_transcript(url: str) -> tuple:
             elif "shorts/" in url:
                 video_id = url.split("shorts/")[1].split("?")[0]
         
-        if not video_id: return None, None
+        if not video_id:
+            logger.error(f"Could not extract video ID from URL: {url}")
+            return None, None
         
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        logger.info(f"Extracting transcript for video ID: {video_id}")
         
+        # Пробуем получить русские субтитры
         try:
-            # 1. Сначала ищем родной русский
-            transcript = transcript_list.find_transcript(['ru'])
+            transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['ru', 'uk'])
             language = "русский"
         except:
             try:
-                # 2. Если нет русского, берем английский и ПЕРЕВОДИМ его на русский
-                raw_transcript = transcript_list.find_transcript(['en'])
-                transcript = raw_transcript.translate('ru')
-                language = "английский (авто-перевод на RU)"
+                transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['en'])
+                language = "английский"
             except:
                 try:
-                    # 3. Крайний случай: берем любой первый язык и переводим на русский
-                    any_transcript = transcript_list.find_transcript([])
-                    transcript = any_transcript.translate('ru')
-                    language = f"авто-перевод с {any_transcript.language}"
-                except:
+                    transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
+                    language = "неизвестный"
+                except Exception as e:
+                    logger.error(f"No transcripts available: {e}")
                     return None, None
-
-        data = transcript.fetch()
-        text = " ".join([t['text'] for t in data])
-        return text[:6000], language
+        
+        # Собираем текст
+        text_parts = [entry['text'] for entry in transcript_list]
+        text = " ".join(text_parts)
+        
+        logger.info(f"Successfully extracted {len(text)} characters")
+        return text[:4000], language
+        
     except Exception as e:
-        logger.error(f"YouTube Error: {e}")
+        logger.error(f"YouTube transcript error: {e}")
         return None, None
 
 async def extract_text_from_url(url: str) -> str:
+    """Извлечение текста из обычной веб-страницы"""
     try:
-        async with httpx.AsyncClient(timeout=10.0) as h_client:
-            resp = await h_client.get(url, follow_redirects=True)
-            soup = BeautifulSoup(resp.content, 'html.parser')
-            for s in soup(["script", "style", "nav", "footer"]): s.decompose()
-            return soup.get_text()[:4000]
-    except: return None
-
-# ===== ЛОГИКА ИИ =====
-
-async def get_ai_response(model_id, messages):
-    try:
-        response = await asyncio.to_thread(
-            client.chat.completions.create,
-            model=model_id, messages=messages, max_tokens=1500
-        )
-        return response.choices[0].message.content
+        async with httpx.AsyncClient(timeout=15.0) as client_http:
+            response = await client_http.get(url, follow_redirects=True)
+            response.raise_for_status()
+            
+            if 'charset' in response.headers.get('content-type', ''):
+                encoding = response.headers['content-type'].split('charset=')[-1]
+            else:
+                encoding = 'utf-8'
+            
+            soup = BeautifulSoup(response.content, 'html.parser', from_encoding=encoding)
+            
+            for script in soup(["script", "style", "nav", "footer", "header"]):
+                script.decompose()
+            
+            text = soup.get_text()
+            lines = (line.strip() for line in text.splitlines())
+            chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+            text = ' '.join(chunk for chunk in chunks if chunk)
+            
+            return text[:4000]
     except Exception as e:
-        return f"❌ Ошибка API: {str(e)[:100]}"
+        logger.error(f"URL extraction error: {e}")
+        return None
 
 async def summarize_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
-    status_msg = await update.message.reply_text("🔍 *Анализирую контент...*", parse_mode=ParseMode.MARKDOWN)
+    """Суммаризация контента по ссылке (поддержка YouTube)"""
+    status_msg = await update.message.reply_text("🔍 *Анализирую ссылку...*", parse_mode=ParseMode.MARKDOWN)
     
-    is_yt = "youtube.com" in url or "youtu.be" in url
-    if is_yt:
-        text, lang = extract_youtube_transcript(url)
+    text = None
+    is_youtube = "youtube.com" in url or "youtu.be" in url
+    language = None
+    
+    if is_youtube:
+        await status_msg.edit_text("🎬 *Обнаружено YouTube видео!*\nИзвлекаю субтитры...", parse_mode=ParseMode.MARKDOWN)
+        text, language = extract_youtube_transcript(url)
+        source = "YouTube видео"
     else:
-        text, lang = await extract_text_from_url(url), "веб-страница"
-
+        text = await extract_text_from_url(url)
+        source = "веб-страницы"
+    
     if not text:
-        await status_msg.edit_text("❌ Не удалось извлечь текст. Проверьте, есть ли в видео субтитры.")
+        if is_youtube:
+            await status_msg.edit_text(
+                "❌ *Не удалось извлечь субтитры из YouTube видео*\n\n"
+                "Возможные причины:\n"
+                "• У видео нет субтитров\n"
+                "• Видео на недоступном языке\n"
+                "• Это короткое видео (Shorts) без субтитров\n\n"
+                "Попробуйте другое видео с субтитрами.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await status_msg.edit_text(
+                "❌ *Не удалось извлечь текст из ссылки*\n\n"
+                "Проверьте, что ссылка открывается и содержит текст.",
+                parse_mode=ParseMode.MARKDOWN
+            )
         return
-
-    model_id = MODEL_IDS.get(context.user_data.get('model', 'gemini'))
-    prompt = f"Сделай краткий пересказ текста (источник: {lang}). Выдели основные тезисы.\n\nТекст: {text}"
+    
+    model_key = context.user_data.get('model', 'gemini')
+    model_id = MODEL_IDS.get(model_key)
+    
+    # Разный промпт для YouTube и обычных ссылок
+    if is_youtube:
+        lang_text = f" на {language} языке" if language else ""
+        prompt = f"""
+        Это транскрипция (субтитры) YouTube видео{lang_text}.
+        
+        Сделай краткое содержание видео:
+        1. О чем видео (основная тема)
+        2. Ключевые моменты (3-5 пунктов)
+        3. Главные выводы
+        
+        Транскрипция:
+        {text}
+        
+        Ответь на русском языке в формате:
+        🎬 *О чем видео:*
+        [2-3 предложения]
+        
+        🔑 *Ключевые моменты:*
+        • [пункт 1]
+        • [пункт 2]
+        • [пункт 3]
+        
+        💡 *Выводы:*
+        [1-2 предложения]
+        """
+    else:
+        prompt = f"""
+        Сделай краткую выжимку из следующего текста. Выдели главные мысли и ключевые факты.
+        
+        Текст:
+        {text}
+        
+        Ответь в формате:
+        📌 *Краткое содержание:*
+        [3-5 предложений]
+        
+        🔑 *Ключевые моменты:*
+        • [пункт 1]
+        • [пункт 2]
+        • [пункт 3]
+        """
+    
+    await status_msg.edit_text("🤔 *Создаю краткое содержание...*", parse_mode=ParseMode.MARKDOWN)
     
     answer = await get_ai_response(model_id, [{"role": "user", "content": prompt}])
-    await status_msg.delete()
-    await update.message.reply_text(f"📝 *Краткое содержание ({lang}):*\n\n{answer}", parse_mode=ParseMode.MARKDOWN)
+    
+    if answer:
+        await status_msg.delete()
+        await update.message.reply_text(answer, parse_mode=ParseMode.MARKDOWN)
+    else:
+        await status_msg.edit_text("❌ Не удалось создать краткое содержание. Попробуйте позже.")
 
-# ===== ОБРАБОТЧИКИ =====
+# ===== ОБРАБОТЧИК МЕНЮ =====
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Привет! Я твой AI-помощник.\nИспользуй кнопки внизу, чтобы управлять мной.",
-        reply_markup=get_main_menu()
-    )
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_menu_commands(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Обработка команд из постоянного меню"""
     text = update.message.text
     user_id = update.effective_user.id
     
+    # Главное меню
     if text == "🤖 Модели":
-        btns = [["🤖 Gemini", "🧠 GPT-4o"], ["🎭 Claude", "💚 GPT-mini"], ["🦙 Llama", "🐋 DeepSeek"], ["🔙 Назад"]]
-        await update.message.reply_text("Выберите модель:", reply_markup=ReplyKeyboardMarkup(btns, resize_keyboard=True))
-        return
-
-    if text == "🗑️ Очистить":
+        await update.message.reply_text(
+            "🎯 *Выберите модель:*\n\n"
+            "📷 *Vision* — видят фото\n"
+            "💎 *Бесплатные*: Gemini, Llama, DeepSeek",
+            reply_markup=get_models_menu(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return True
+        
+    elif text == "🎭 Личности":
+        await update.message.reply_text(
+            "🎭 *Выберите личность:*\n\n"
+            "Каждая личность меняет стиль общения и подход к ответам.",
+            reply_markup=get_personas_menu(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return True
+        
+    elif text == "🎨 Картинка":
+        await update.message.reply_text(
+            "🎨 *Создание картинки*\n\n"
+            "Просто напишите: `/image описание`\n\n"
+            "Примеры:\n"
+            "`/image кот в космосе`\n"
+            "`/image логотип минимализм`\n"
+            "`/image закат над морем, цифровой арт`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return True
+        
+    elif text == "🔗 Анализ ссылки":
+        await update.message.reply_text(
+            "🔗 *Анализ ссылки*\n\n"
+            "Просто отправьте любую ссылку, и я сделаю краткое содержание!\n\n"
+            "Поддерживается:\n"
+            "• YouTube видео (с субтитрами)\n"
+            "• Веб-страницы\n"
+            "• Статьи\n"
+            "• Новости"
+        )
+        return True
+        
+    elif text == "🗑️ Очистить":
         user_chats[user_id] = []
-        await update.message.reply_text("🧹 История диалога очищена.")
-        return
-
-    if text == "🔙 Назад":
-        await start(update, context)
-        return
-
-    # Обработка выбора модели
-    model_map = {"🤖 Gemini": "gemini", "🧠 GPT-4o": "gpt-4o", "🎭 Claude": "claude", "💚 GPT-mini": "gpt-mini", "🦙 Llama": "llama", "🐋 DeepSeek": "deepseek"}
+        await update.message.reply_text(
+            "🧹 *История диалога очищена!*",
+            reply_markup=get_main_menu(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return True
+        
+    elif text == "ℹ️ Помощь":
+        await help_command(update, context)
+        return True
+        
+    elif text == "🔙 Назад":
+        await update.message.reply_text(
+            "👋 *Главное меню*",
+            reply_markup=get_main_menu(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return True
+    
+    # Выбор моделей
+    model_map = {
+        "🤖 Gemini": "gemini",
+        "🧠 GPT-4o": "gpt-4o",
+        "🎭 Claude": "claude",
+        "💚 GPT-4o Mini": "gpt-mini",
+        "🦙 Llama": "llama",
+        "🐋 DeepSeek": "deepseek"
+    }
     if text in model_map:
-        context.user_data['model'] = model_map[text]
-        await update.message.reply_text(f"✅ Установлена модель: {text}", reply_markup=get_main_menu())
+        model_key = model_map[text]
+        context.user_data['model'] = model_key
+        model_name = MODELS_INFO[model_key]["name"]
+        await update.message.reply_text(
+            f"✅ *Установлена модель:* {model_name}\n\n{MODELS_INFO[model_key]['desc']}",
+            reply_markup=get_main_menu(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return True
+    
+    # Выбор личностей
+    persona_map = {
+        "🤖 Ассистент": "default",
+        "💻 Python Dev": "coder",
+        "🌍 Переводчик": "translator",
+        "📚 Учитель": "teacher",
+        "✍️ Копирайтер": "writer",
+        "🎭 Психолог": "psychologist",
+        "📱 SMM": "smm",
+        "📊 Аналитик": "analyst"
+    }
+    if text in persona_map:
+        persona_key = persona_map[text]
+        user_persona[user_id] = persona_key
+        persona_name = PERSONAS[persona_key]["name"]
+        await update.message.reply_text(
+            f"✅ *Установлена личность:* {persona_name}",
+            reply_markup=get_main_menu(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return True
+    
+    return False
+
+# ===== КОМАНДЫ =====
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start"""
+    user_id = update.effective_user.id
+    
+    # Получаем текущие настройки
+    model_key = context.user_data.get('model', 'gemini')
+    current_model = MODELS_INFO[model_key]["name"]
+    current_persona = user_persona.get(user_id, "default")
+    persona_name = PERSONAS[current_persona]["name"]
+    
+    await update.message.reply_text(
+        f"👋 *Привет! Я твой AI-ассистент!*\n\n"
+        f"⚙️ **Модель:** {current_model}\n"
+        f"🎭 **Личность:** {persona_name}\n\n"
+        f"Я умею:\n"
+        f"📝 Отвечать на вопросы\n"
+        f"🎨 Генерировать картинки\n"
+        f"🔗 Анализировать ссылки (включая YouTube!)\n"
+        f"📷 Распознавать фото\n"
+        f"🎙️ Слышать голос\n"
+        f"👥 *В группах:* упомяните меня @{context.bot.username} или ответьте на моё сообщение\n\n"
+        f"👇 *Используй меню внизу для навигации!*",
+        reply_markup=get_main_menu(),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /help"""
+    bot_username = (await context.bot.get_me()).username
+    help_text = f"""
+📚 *Доступные команды:*
+
+/start - Главное меню
+/help - Показать это сообщение
+/image [описание] - Создать картинку
+
+*Как пользоваться:*
+• Используйте меню внизу для навигации
+• Просто отправьте текст - я отвечу
+• Отправьте фото с вопросом - я проанализирую
+• Отправьте голосовое сообщение - я распознаю
+• **Отправьте ссылку на YouTube** - я сделаю краткое содержание видео! 🎬
+
+*В группах:*
+• Упомяните меня @{bot_username} - я отвечу
+• Ответьте на моё сообщение - я отвечу
+• Иногда я сам вступаю в разговор (15% шанс) 🎭
+
+*YouTube возможности:*
+• Извлекаю субтитры из видео
+• Делаю краткое содержание
+• Выделяю ключевые моменты
+• Работает с русскими и английскими субтитрами
+    """
+    await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
+
+async def generate_image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /image"""
+    chat_id = update.effective_chat.id
+    
+    if not context.args:
+        await update.message.reply_text(
+            "❌ *Ошибка:* напишите описание после команды.\n\n"
+            "Пример:\n`/image красный закат над морем`\n`/image логотип минимализм`\n`/image кот в космосе`",
+            parse_mode=ParseMode.MARKDOWN
+        )
         return
 
-    # Анализ ссылок
-    url_match = re.search(r'https?://[^\s]+', text) if text else None
-    if url_match:
-        await summarize_url(update, context, url_match.group())
-        return
+    prompt = " ".join(context.args)
+    
+    status_msg = await update.message.reply_text(
+        f"⏳ *Генерирую:* `{prompt}`...",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    await context.bot.send_chat_action(chat_id=chat_id, action="upload_photo")
 
-    # Обычный диалог
-    if user_id not in user_chats: user_chats[user_id] = []
-    user_chats[user_id].append({"role": "user", "content": text})
+    encoded_prompt = urllib.parse.quote(prompt)
+    image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?nologo=true&width=1024&height=1024"
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client_http:
+            response = await client_http.get(image_url)
+            
+            if response.status_code == 200:
+                await update.message.reply_photo(
+                    photo=response.content,
+                    caption=f"🎨 *Результат:* `{prompt}`",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                await context.bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
+            else:
+                await status_msg.edit_text("❌ Сервис генерации временно недоступен.")
+    except Exception as e:
+        logger.error(f"Image Gen Error: {e}")
+        await status_msg.edit_text(f"❌ Ошибка: {str(e)[:100]}")
+
+# ===== ОБРАБОТЧИК ЛИЧНЫХ СООБЩЕНИЙ =====
+
+async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка личных сообщений"""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
     
-    model_id = MODEL_IDS.get(context.user_data.get('model', 'gemini'))
-    persona = PERSONAS.get(user_persona.get(user_id, "default"))["prompt"]
+    # Сначала проверяем команды меню
+    if await handle_menu_commands(update, context):
+        return
     
-    messages = [{"role": "system", "content": persona}] + user_chats[user_id][-MAX_HISTORY_LENGTH:]
+    # Антиспам
+    current_time = time.time()
+    if current_time - user_last_message[user_id] < 1:
+        await update.message.reply_text("⏳ Подождите секунду...")
+        return
+    user_last_message[user_id] = current_time
     
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-    answer = await get_ai_response(model_id, messages)
+    # Проверяем ссылку (включая YouTube)
+    if update.message.text and re.match(r'https?://[^\s]+', update.message.text):
+        url_match = re.search(r'https?://[^\s]+', update.message.text)
+        if url_match:
+            await summarize_url(update, context, url_match.group())
+            return
+    
+    # Инициализация истории
+    if user_id not in user_chats:
+        user_chats[user_id] = []
+    
+    # Получаем модель и личность
+    model_key = context.user_data.get('model', 'gemini')
+    model_id = MODEL_IDS.get(model_key)
+    persona_key = user_persona.get(user_id, "default")
+    persona_prompt = PERSONAS[persona_key]["prompt"]
+    
+    content = []
+    
+    # Обработка текста
+    if update.message.text:
+        content = [{"type": "text", "text": update.message.text}]
+        
+    # Обработка фото
+    elif update.message.photo:
+        if model_id not in VISION_MODELS:
+            await update.message.reply_text(
+                f"❌ Модель {MODELS_INFO[model_key]['name']} не умеет анализировать фото.\n"
+                "Выберите Gemini или GPT-4o в меню 'Модели'."
+            )
+            return
+        
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        photo_file = await update.message.photo[-1].get_file()
+        photo_bytes = await photo_file.download_as_bytearray()
+        base64_image = base64.b64encode(photo_bytes).decode('utf-8')
+        caption = update.message.caption or "Что на этой картинке?"
+        content = [
+            {"type": "text", "text": caption},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+        ]
+        
+    # Обработка голоса
+    elif update.message.voice:
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        voice_file = await update.message.voice.get_file()
+        file_path = f"voice_{user_id}_{int(time.time())}.ogg"
+        
+        try:
+            await voice_file.download_to_drive(file_path)
+            with open(file_path, "rb") as audio_file:
+                transcript = client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio_file
+                )
+            await update.message.reply_text(
+                f"🎤 *Распознано:* {transcript.text}",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            content = [{"type": "text", "text": transcript.text}]
+        except Exception as e:
+            logger.error(f"Whisper Error: {e}")
+            await update.message.reply_text("❌ Ошибка распознавания голоса.")
+            return
+        finally:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+    
+    if not content:
+        return
+    
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    
+    # Сохраняем историю
+    user_chats[user_id].append({"role": "user", "content": content})
+    
+    # Подготавливаем запрос
+    messages_for_api = [{"role": "system", "content": persona_prompt}]
+    for m in user_chats[user_id][-MAX_HISTORY_LENGTH:]:
+        if isinstance(m["content"], list):
+            text_parts = [item["text"] for item in m["content"] if item.get("type") == "text"]
+            combined_text = " ".join(text_parts) if text_parts else ""
+            messages_for_api.append({"role": m["role"], "content": combined_text})
+        else:
+            messages_for_api.append(m)
+    
+    if messages_for_api:
+        messages_for_api[-1]["content"] = content
+    
+    # Получаем ответ
+    answer = await get_ai_response(model_id, messages_for_api)
+    if not answer:
+        answer = "⚠️ Ошибка связи с AI. Попробуйте позже."
     
     user_chats[user_id].append({"role": "assistant", "content": answer})
-    await update.message.reply_text(answer, parse_mode=ParseMode.MARKDOWN)
+    
+    # Отправляем ответ
+    if len(answer) > 4096:
+        for i in range(0, len(answer), 4096):
+            await update.message.reply_text(answer[i:i+4096])
+    else:
+        await update.message.reply_text(answer, parse_mode=ParseMode.MARKDOWN)
 
-# ===== ЗАПУСК СЕРВЕРА =====
+# ===== ОБРАБОТЧИК ГРУППОВЫХ СООБЩЕНИЙ (ИСПРАВЛЕННЫЙ) =====
+
+async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка сообщений в группах"""
+    message = update.message
+    chat_id = message.chat_id
+    
+    # Логируем для отладки
+    logger.info(f"Group message in chat {chat_id}: {message.text if message.text else 'non-text'}")
+    
+    # Игнорируем сообщения от ботов
+    if message.from_user and message.from_user.is_bot:
+        logger.info("Ignoring message from bot")
+        return
+    
+    # Сохраняем сообщение в историю группы
+    user_name = message.from_user.first_name if message.from_user else "Пользователь"
+    text = message.text or message.caption or ""
+    
+    group_messages[chat_id].append({
+        "name": user_name,
+        "text": text,
+        "user_id": message.from_user.id if message.from_user else 0,
+        "timestamp": time.time()
+    })
+    
+    # Оставляем только последние 50 сообщений
+    if len(group_messages[chat_id]) > 50:
+        group_messages[chat_id] = group_messages[chat_id][-50:]
+    
+    # Получаем информацию о боте
+    bot_info = await context.bot.get_me()
+    bot_username = bot_info.username
+    bot_id = bot_info.id
+    
+    # Проверяем, нужно ли отвечать
+    should_reply = False
+    reply_type = "none"
+    
+    # 1. Если бота упомянули (через @username)
+    if message.text and f"@{bot_username}" in message.text:
+        should_reply = True
+        reply_type = "mention"
+        logger.info(f"Bot mentioned in group {chat_id}")
+    
+    # 2. Если ответили на сообщение бота
+    elif (message.reply_to_message and 
+          message.reply_to_message.from_user and 
+          message.reply_to_message.from_user.id == bot_id):
+        should_reply = True
+        reply_type = "reply"
+        logger.info(f"Reply to bot in group {chat_id}")
+    
+    # 3. Случайный шанс ответить спонтанно
+    elif (len(text) >= GROUP_CONFIG["min_message_length"] and 
+          random.randint(1, 100) <= GROUP_CONFIG["spontaneous_chance"]):
+        should_reply = True
+        reply_type = "spontaneous"
+        logger.info(f"Spontaneous reply in group {chat_id} (chance: {GROUP_CONFIG['spontaneous_chance']}%)")
+    
+    if not should_reply:
+        return
+    
+    # Собираем контекст последних сообщений
+    context_lines = []
+    for msg in group_messages[chat_id][-GROUP_CONFIG["max_context_messages"]:]:
+        if msg["text"]:
+            context_lines.append(f"{msg['name']}: {msg['text']}")
+    
+    if not context_lines:
+        logger.warning(f"No context lines for group {chat_id}")
+        return
+    
+    context_text = "\n".join(context_lines)
+    
+    # Разные промпты для разных типов ответов
+    prompts = {
+        "mention": f"""Ты участник чата в Telegram. Тебя упомянули в разговоре. 
+Ответь весело, коротко (1-2 предложения), используй эмодзи. Будь естественным, как живой человек.
+
+Контекст разговора:
+{context_text}
+
+Твой ответ (только ответ, без пояснений):""",
+        
+        "reply": f"""Ты участник чата в Telegram. Ты отвечаешь на сообщение, обращенное к тебе.
+Будь остроумным, дружелюбным. Коротко (1-2 предложения).
+
+Контекст:
+{context_text}
+
+Твой ответ:""",
+        
+        "spontaneous": f"""Ты активный участник чата в Telegram. Видишь, что люди обсуждают что-то интересное.
+Напиши короткую шутку, подкол или остроумный комментарий (1-2 предложения).
+
+Контекст разговора:
+{context_text}
+
+Твой комментарий:"""
+    }
+    
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    
+    # Используем бесплатную модель для групповых ответов (экономия)
+    answer = await get_ai_response(
+        MODEL_IDS["llama"],
+        [{"role": "user", "content": prompts.get(reply_type, prompts["spontaneous"])}]
+    )
+    
+    # Если AI не ответил, используем запасные фразы
+    if not answer or len(answer) < 3:
+        jokes = [
+            "😏 Интересный разговор...",
+            "🤔 Я бы сказал что-то умное, но промолчу",
+            "🍿 Сижу, попкорн ем, наблюдаю...",
+            "😄 Продолжайте, я слушаю!",
+            "🤨 Ну-ну...",
+            "😂 Вы тут повеселились без меня!"
+        ]
+        answer = random.choice(jokes)
+    
+    await message.reply_text(answer, parse_mode=ParseMode.MARKDOWN)
+    logger.info(f"Replied in group {chat_id} with type: {reply_type}")
+
+# ===== СЕРВЕРНАЯ ЧАСТЬ =====
 
 async def main():
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE, handle_message))
+    """Главная функция запуска бота"""
+    if not TOKEN or not OPENROUTER_API_KEY:
+        logger.error("Не хватает переменных окружения!")
+        return
     
-    if URL:
-        await app.bot.set_webhook(f"{URL}/telegram")
-    
-    async def telegram_webhook(request: Request) -> Response:
-        json_data = await request.json()
-        await app.update_queue.put(Update.de_json(json_data, app.bot))
-        return Response()
-    
-    starlette_app = Starlette(routes=[
-        Route("/telegram", telegram_webhook, methods=["POST"]),
-        Route("/healthcheck", lambda _: PlainTextResponse("ok"), methods=["GET"])
-    ])
-    
-    import uvicorn
-    config = uvicorn.Config(app=starlette_app, host="0.0.0.0", port=PORT)
-    server = uvicorn.Server(config)
-    
-    async with app:
-        await app.start()
-        await server.serve()
-        await app.stop()
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    app = Application
