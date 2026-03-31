@@ -1,7 +1,10 @@
 """
 Полная версия Telegram-бота с исправленным извлечением субтитров YouTube.
-Переменные окружения: TELEGRAM_TOKEN, OPENROUTER_API_KEY, RENDER_EXTERNAL_URL (для webhook), PORT.
-Опционально: USE_POLLING=1 — локальный запуск через polling вместо webhook.
+
+Переменные окружения:
+  TELEGRAM_TOKEN, OPENROUTER_API_KEY, RENDER_EXTERNAL_URL (webhook), PORT
+  USE_POLLING=1 — polling вместо webhook
+  YOUTUBE_TRANSCRIPT_PROXY или HTTPS_PROXY — URL прокси (обход блокировки IP на Render/AWS и т.д.)
 """
 from __future__ import annotations
 
@@ -34,19 +37,33 @@ from telegram.ext import (
     filters,
 )
 
-# YouTube субтитры
+# YouTube субтитры (v1.x: экземпляр .fetch() / .list(); v0.x: класс .get_transcript())
 try:
     from youtube_transcript_api import YouTubeTranscriptApi
+
+    YT_API_AVAILABLE = True
+    YT_API_V1 = not hasattr(YouTubeTranscriptApi, "get_transcript")
     from youtube_transcript_api._errors import (
         NoTranscriptFound,
-        TooManyRequests,
         TranscriptsDisabled,
         VideoUnavailable,
     )
-
-    YT_API_AVAILABLE = True
+    try:
+        from youtube_transcript_api._errors import TooManyRequests
+    except ImportError:
+        TooManyRequests = None  # type: ignore
+    try:
+        from youtube_transcript_api._errors import IpBlocked, RequestBlocked
+    except ImportError:
+        IpBlocked = None  # type: ignore
+        RequestBlocked = None  # type: ignore
 except ImportError:
     YT_API_AVAILABLE = False
+    YT_API_V1 = False
+    YouTubeTranscriptApi = None  # type: ignore
+    TooManyRequests = None
+    IpBlocked = None
+    RequestBlocked = None
 
 # ----- Логирование -----
 logging.basicConfig(
@@ -62,6 +79,11 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
 PORT = int(os.getenv("PORT", "8000"))
 USE_POLLING = os.getenv("USE_POLLING", "").lower() in ("1", "true", "yes")
+
+# Прокси для YouTube (облачные IP часто получают 429 / страницу google.com/sorry)
+# Задайте один URL, например: https://user:pass@host:port или http://host:port
+YOUTUBE_TRANSCRIPT_PROXY = (os.environ.get("YOUTUBE_TRANSCRIPT_PROXY") or "").strip()
+HTTPS_PROXY_ENV = (os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or "").strip()
 
 if not TOKEN:
     logger.error("TELEGRAM_TOKEN не установлен!")
@@ -185,6 +207,82 @@ _YOUTUBE_ID_RE = re.compile(
 )
 
 
+def _youtube_proxy_url() -> Optional[str]:
+    p = YOUTUBE_TRANSCRIPT_PROXY or HTTPS_PROXY_ENV
+    return p if p else None
+
+
+def _youtube_requests_proxies() -> Optional[dict]:
+    """Словарь proxies для youtube-transcript-api 0.x (requests)."""
+    p = _youtube_proxy_url()
+    if not p:
+        return None
+    return {"http": p, "https": p}
+
+
+def _youtube_api_client():
+    """Клиент youtube-transcript-api 1.x с опциональным прокси."""
+    from youtube_transcript_api.proxies import GenericProxyConfig
+
+    p = _youtube_proxy_url()
+    if p:
+        return YouTubeTranscriptApi(
+            proxy_config=GenericProxyConfig(http_url=p, https_url=p),
+        )
+    return YouTubeTranscriptApi()
+
+
+def _is_youtube_blocked_error(text: str) -> bool:
+    t = text.lower()
+    return (
+        "429" in text
+        or "too many requests" in t
+        or "google.com/sorry" in t
+        or "/sorry/index" in t
+        or "ipblocked" in t
+        or "requestblocked" in t
+        or "blocking requests from your ip" in t
+        or "клиентская ошибка" in t
+        or "client error" in t
+    )
+
+
+def _humanize_youtube_exception(exc: BaseException) -> str:
+    """Понятное сообщение вместо сырого traceback от Google/YouTube."""
+    if IpBlocked is not None and isinstance(exc, IpBlocked):
+        return _proxy_help_message()
+    if RequestBlocked is not None and isinstance(exc, RequestBlocked):
+        return _proxy_help_message()
+
+    raw = str(exc)
+    if _is_youtube_blocked_error(raw):
+        return _proxy_help_message()
+    if len(raw) > 350:
+        return raw[:350] + "…"
+    return raw
+
+
+def _proxy_help_message() -> str:
+    return (
+        "YouTube *блокирует* запросы с IP вашего сервера (типично для облака: Render, Railway, AWS). "
+        "Это *не* значит, что у видео нет субтитров.\n\n"
+        "*Решение:* в настройках сервиса задайте переменную `YOUTUBE_TRANSCRIPT_PROXY` "
+        "(или `HTTPS_PROXY`) — URL резидентского/мобильного прокси и перезапустите бота.\n"
+        "Подробнее: README пакета youtube-transcript-api, раздел про IP bans."
+    )
+
+
+def _fetched_to_text(fetched) -> str:
+    """Совместимость: list[dict] (v0) и FetchedTranscript / snippets (v1)."""
+    if fetched is None:
+        return ""
+    if isinstance(fetched, list) and (not fetched or isinstance(fetched[0], dict)):
+        return " ".join(entry.get("text", "") for entry in fetched)
+    if hasattr(fetched, "snippets"):
+        return " ".join(s.text for s in fetched.snippets)
+    return " ".join(getattr(s, "text", str(s)) for s in fetched)
+
+
 def _extract_youtube_video_id(url: str) -> Optional[str]:
     url = url.strip()
     m = _YOUTUBE_ID_RE.search(url)
@@ -199,9 +297,131 @@ def _extract_youtube_video_id(url: str) -> Optional[str]:
     return None
 
 
+def _extract_youtube_transcript_v1(video_id: str, langs_try: list) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """youtube-transcript-api 1.x — экземпляр API + fetch/list."""
+    api = _youtube_api_client()
+    if _youtube_proxy_url():
+        logger.info("YouTube: используется прокси (v1 API)")
+
+    try:
+        fetched = api.fetch(video_id, languages=langs_try)
+        text = _fetched_to_text(fetched)
+        if text.strip():
+            return text[:4000], "auto", None
+    except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable) as e:
+        logger.warning("fetch: %s", e)
+    except Exception as e:
+        logger.warning("fetch unexpected: %s", e)
+        if IpBlocked is not None and isinstance(e, IpBlocked):
+            return None, None, _humanize_youtube_exception(e)
+        if RequestBlocked is not None and isinstance(e, RequestBlocked):
+            return None, None, _humanize_youtube_exception(e)
+        if _is_youtube_blocked_error(str(e)):
+            return None, None, _humanize_youtube_exception(e)
+
+    try:
+        tlist = api.list(video_id)
+        manual = [t for t in tlist if not t.is_generated]
+        generated = [t for t in tlist if t.is_generated]
+        for t in manual + generated:
+            try:
+                data = t.fetch()
+                text = _fetched_to_text(data)
+                if text.strip():
+                    return text[:4000], t.language_code, None
+            except Exception as ex:
+                logger.debug("track fetch failed %s: %s", getattr(t, "language_code", "?"), ex)
+                if IpBlocked is not None and isinstance(ex, IpBlocked):
+                    return None, None, _humanize_youtube_exception(ex)
+                if _is_youtube_blocked_error(str(ex)):
+                    return None, None, _humanize_youtube_exception(ex)
+
+        try:
+            tr = tlist.find_transcript(["en"])
+            data = tr.translate("ru").fetch()
+            text = _fetched_to_text(data)
+            if text.strip():
+                return text[:4000], "ru (перевод с en)", None
+        except Exception as ex:
+            logger.warning("translate fallback: %s", ex)
+            if IpBlocked is not None and isinstance(ex, IpBlocked):
+                return None, None, _humanize_youtube_exception(ex)
+            if _is_youtube_blocked_error(str(ex)):
+                return None, None, _humanize_youtube_exception(ex)
+
+    except TranscriptsDisabled:
+        return None, None, "У этого видео отключены субтитры."
+    except (NoTranscriptFound, VideoUnavailable) as e:
+        return None, None, f"Субтитры недоступны: {e}"
+    except Exception as e:
+        logger.exception("list error (v1)")
+        return None, None, _humanize_youtube_exception(e)
+
+    return None, None, None
+
+
+def _extract_youtube_transcript_v0(video_id: str, langs_try: list) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """youtube-transcript-api 0.x — статические методы + proxies=dict."""
+    proxies = _youtube_requests_proxies()
+    if proxies:
+        logger.info("YouTube: используется прокси (v0 API)")
+
+    kw = {"proxies": proxies} if proxies else {}
+
+    try:
+        transcript_data = YouTubeTranscriptApi.get_transcript(video_id, languages=langs_try, **kw)
+        text = _fetched_to_text(transcript_data)
+        return text[:4000], "auto", None
+    except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable) as e:
+        logger.warning("get_transcript: %s", e)
+    except Exception as e:
+        if TooManyRequests is not None and type(e).__name__ == "TooManyRequests":
+            return None, None, _humanize_youtube_exception(e)
+        logger.warning("get_transcript unexpected: %s", e)
+        if _is_youtube_blocked_error(str(e)):
+            return None, None, _humanize_youtube_exception(e)
+
+    try:
+        tlist = YouTubeTranscriptApi.list_transcripts(video_id, **kw)
+        manual = [t for t in tlist if not t.is_generated]
+        generated = [t for t in tlist if t.is_generated]
+        for t in manual + generated:
+            try:
+                data = t.fetch()
+                text = _fetched_to_text(data)
+                return text[:4000], t.language_code, None
+            except Exception as ex:
+                logger.debug("fetch failed %s: %s", getattr(t, "language_code", "?"), ex)
+                if _is_youtube_blocked_error(str(ex)):
+                    return None, None, _humanize_youtube_exception(ex)
+
+        try:
+            tr = tlist.find_transcript(["en"])
+            data = tr.translate("ru").fetch()
+            text = _fetched_to_text(data)
+            return text[:4000], "ru (перевод с en)", None
+        except Exception as ex:
+            logger.warning("translate fallback: %s", ex)
+            if _is_youtube_blocked_error(str(ex)):
+                return None, None, _humanize_youtube_exception(ex)
+
+    except TranscriptsDisabled:
+        return None, None, "У этого видео отключены субтитры."
+    except (NoTranscriptFound, VideoUnavailable) as e:
+        return None, None, f"Субтитры недоступны: {e}"
+    except Exception as e:
+        if TooManyRequests is not None and type(e).__name__ == "TooManyRequests":
+            return None, None, _humanize_youtube_exception(e)
+        logger.exception("list_transcripts error (v0)")
+        return None, None, _humanize_youtube_exception(e)
+
+    return None, None, None
+
+
 def extract_youtube_transcript(url: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """
     Возвращает (text, language_code_or_label, error_message).
+    На облачных IP без прокси YouTube часто отвечает 429 / блокировкой — задайте YOUTUBE_TRANSCRIPT_PROXY.
     """
     if not YT_API_AVAILABLE:
         return None, None, "Библиотека youtube-transcript-api не установлена"
@@ -228,55 +448,20 @@ def extract_youtube_transcript(url: str) -> Tuple[Optional[str], Optional[str], 
         "tr",
     ]
 
-    # 1) get_transcript — перебор языков по порядку
-    try:
-        transcript_data = YouTubeTranscriptApi.get_transcript(video_id, languages=langs_try)
-        text = " ".join(entry["text"] for entry in transcript_data)
-        return text[:4000], "auto", None
-    except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable) as e:
-        logger.warning("get_transcript: %s", e)
-    except TooManyRequests as e:
-        logger.warning("TooManyRequests: %s", e)
-        return None, None, "Слишком много запросов к YouTube. Попробуйте позже."
-    except Exception as e:
-        logger.warning("get_transcript unexpected: %s", e)
+    if YT_API_V1:
+        text, lang, err = _extract_youtube_transcript_v1(video_id, langs_try)
+    else:
+        text, lang, err = _extract_youtube_transcript_v0(video_id, langs_try)
 
-    # 2) Любая дорожка: сначала ручные, потом авто
-    try:
-        tlist = YouTubeTranscriptApi.list_transcripts(video_id)
-        manual = [t for t in tlist if not t.is_generated]
-        generated = [t for t in tlist if t.is_generated]
-        for t in manual + generated:
-            try:
-                data = t.fetch()
-                text = " ".join(entry["text"] for entry in data)
-                return text[:4000], t.language_code, None
-            except Exception as ex:
-                logger.debug("fetch failed %s: %s", getattr(t, "language_code", "?"), ex)
-
-        # 3) Перевод EN -> RU
-        try:
-            tr = tlist.find_transcript(["en"])
-            data = tr.translate("ru").fetch()
-            text = " ".join(entry["text"] for entry in data)
-            return text[:4000], "ru (перевод с en)", None
-        except Exception as ex:
-            logger.warning("translate fallback: %s", ex)
-
-    except TranscriptsDisabled:
-        return None, None, "У этого видео отключены субтитры."
-    except (NoTranscriptFound, VideoUnavailable) as e:
-        return None, None, f"Субтитры недоступны: {e}"
-    except TooManyRequests:
-        return None, None, "Слишком много запросов к YouTube. Попробуйте позже."
-    except Exception as e:
-        logger.exception("list_transcripts error")
-        return None, None, f"Ошибка: {str(e)[:200]}"
+    if text:
+        return text, lang, None
+    if err:
+        return None, None, err
 
     return (
         None,
         None,
-        "Не удалось получить субтитры. Возможно, их нет, видео недоступно или YouTube блокирует запрос с сервера.",
+        "Не удалось получить субтитры. Задайте `YOUTUBE_TRANSCRIPT_PROXY` на сервере или проверьте, что у ролика есть субтитры.",
     )
 
 
@@ -317,7 +502,7 @@ async def summarize_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url:
             "🎬 *Обнаружено YouTube видео!*\nПроверяю субтитры (в т.ч. авто)...",
             parse_mode=ParseMode.MARKDOWN,
         )
-        text, language, error_msg = extract_youtube_transcript(url)
+        text, language, error_msg = await asyncio.to_thread(extract_youtube_transcript, url)
 
         if error_msg:
             await status_msg.edit_text(
