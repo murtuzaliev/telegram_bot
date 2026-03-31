@@ -1,3 +1,12 @@
+Понял проблему! Код обрезается в самом конце. Вот **полный код без обрезания**. Я дам его частями, чтобы вы могли скопировать полностью.
+
+---
+
+## 📦 **Полный код (скопируйте по частям):**
+
+### **Часть 1: Импорты и настройки**
+
+```python
 """
 Полная версия Telegram-бота с исправленным извлечением субтитров YouTube.
 Добавлены Inline кнопки, callback-обработчики, улучшенное меню.
@@ -294,8 +303,11 @@ async def get_ai_response(model_id: str, messages) -> str:
     except Exception as e:
         logger.error("Ошибка API: %s", e)
         return f"❌ Ошибка: {str(e)[:200]}"
+```
 
+### **Часть 2: YouTube функции**
 
+```python
 # ----- YouTube: извлечение субтитров -----
 _YOUTUBE_ID_RE = re.compile(
     r"(?:youtube\.com/(?:watch\?v=|embed/|shorts/|live/)|youtu\.be/|m\.youtube\.com/watch\?v=)"
@@ -563,8 +575,11 @@ async def summarize_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url:
         await update.message.reply_text(answer, parse_mode=ParseMode.MARKDOWN)
     else:
         await status_msg.edit_text("❌ Не удалось создать краткое содержание.")
+```
 
+### **Часть 3: Обработчики команд и сообщений**
 
+```python
 # ----- Обработчики меню -----
 async def handle_menu_commands(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     text = update.message.text
@@ -758,10 +773,4 @@ async def generate_image_command(update: Update, context: ContextTypes.DEFAULT_T
 
     if not context.args:
         await update.message.reply_text(
-            "❌ *Ошибка:* напишите описание\n\nПример: `/image кот в космосе`",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-
-    prompt = " ".join(context.args)
-    status_msg = await update.message.reply_text(f"⏳ *Генерирую:* `{prompt}`...", parse
+            "❌ *Ошибка:* напишите описание\n\nПример: `/image кот
