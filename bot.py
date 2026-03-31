@@ -42,22 +42,19 @@ MODEL_IDS = {
 }
 
 MODELS_INFO = {
-    "gemini": {"icon": "🤖", "name": "Gemini 2.0 Flash", "desc": "Быстрая, умная, бесплатно", "vision": True},
-    "gpt-4o": {"icon": "🧠", "name": "GPT-4o", "desc": "Видит фото, мощная", "vision": True},
-    "claude": {"icon": "🎭", "name": "Claude 3.5 Sonnet", "desc": "Креативная", "vision": True},
-    "gpt-mini": {"icon": "💚", "name": "GPT-4o Mini", "desc": "Экономичная", "vision": True},
-    "llama": {"icon": "🦙", "name": "Llama 3.3", "desc": "Бесплатно", "vision": False},
-    "deepseek": {"icon": "🐋", "name": "DeepSeek V3", "desc": "Мощная", "vision": False},
+    "gemini": {"icon": "🤖", "name": "Gemini 2.0 Flash", "desc": "Быстрая, умная, бесплатно"},
+    "gpt-4o": {"icon": "🧠", "name": "GPT-4o", "desc": "Видит фото, мощная"},
+    "claude": {"icon": "🎭", "name": "Claude 3.5 Sonnet", "desc": "Креативная"},
+    "gpt-mini": {"icon": "💚", "name": "GPT-4o Mini", "desc": "Экономичная"},
+    "llama": {"icon": "🦙", "name": "Llama 3.3", "desc": "Бесплатно"},
+    "deepseek": {"icon": "🐋", "name": "DeepSeek V3", "desc": "Мощная"},
 }
-
-VISION_MODELS = ["google/gemini-2.0-flash-001", "openai/gpt-4o", "openai/gpt-4o-mini", "anthropic/claude-3.5-sonnet"]
 
 # ===== СИСТЕМА ЛИЧНОСТЕЙ =====
 PERSONAS = {
-    "default": {"name": "🤖 Ассистент", "prompt": "Ты полезный ассистент. Отвечай кратко."},
-    "coder": {"name": "💻 Python Dev", "prompt": "Ты Senior Python разработчик. Давай код и объяснения."},
-    "translator": {"name": "🌍 Переводчик", "prompt": "Ты переводчик. Переводи всё на русский."},
-    "analyst": {"name": "📊 Аналитик", "prompt": "Ты бизнес-аналитик. Структурируй информацию."}
+    "default": {"name": "🤖 Ассистент", "prompt": "Ты полезный ассистент. Отвечай кратко и по делу."},
+    "coder": {"name": "💻 Python Dev", "prompt": "Ты Senior Python разработчик. Давай код и объяснения для новичка."},
+    "translator": {"name": "🌍 Переводчик", "prompt": "Ты профессиональный переводчик. Переводи всё на русский."},
 }
 
 # Хранилища
@@ -70,13 +67,17 @@ client = OpenAI(api_key=OPENROUTER_API_KEY, base_url=OPENROUTER_BASE_URL)
 # ===== МЕНЮ =====
 
 def get_main_menu():
-    keyboard = [["🤖 Модели", "🎭 Личности"], ["🎨 Картинка", "🔗 Анализ ссылки"], ["🗑️ Очистить", "ℹ️ Помощь"]]
+    keyboard = [
+        ["🤖 Модели", "🎭 Личности"],
+        ["🎨 Картинка", "🔗 Анализ ссылки"],
+        ["🗑️ Очистить", "ℹ️ Помощь"]
+    ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 # ===== ФУНКЦИИ ИЗВЛЕЧЕНИЯ ДАННЫХ =====
 
 def extract_youtube_transcript(url: str) -> tuple:
-    """Извлечение субтитров с ПРИНУДИТЕЛЬНЫМ переводом на русский"""
+    """Извлечение субтитров с ПРИНУДИТЕЛЬНЫМ авто-переводом на русский"""
     try:
         video_id = None
         if "youtu.be" in url:
@@ -92,23 +93,21 @@ def extract_youtube_transcript(url: str) -> tuple:
         transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
         
         try:
-            # Пытаемся найти русский (оригинал или авто)
+            # 1. Сначала ищем родной русский
             transcript = transcript_list.find_transcript(['ru'])
             language = "русский"
         except:
             try:
-                # Пытаемся найти английский и ПЕРЕВЕСТИ его на русский
+                # 2. Если нет русского, берем английский и ПЕРЕВОДИМ его на русский
                 raw_transcript = transcript_list.find_transcript(['en'])
                 transcript = raw_transcript.translate('ru')
-                language = "английский (авто-перевод)"
+                language = "английский (авто-перевод на RU)"
             except:
                 try:
-                    # Берем вообще любой доступный язык и переводим на русский
-                    any_lang = list(transcript_list._manually_created_transcripts.keys()) + \
-                               list(transcript_list._generated_transcripts.keys())
-                    raw_transcript = transcript_list.find_transcript([any_lang[0]])
-                    transcript = raw_transcript.translate('ru')
-                    language = f"авто-перевод с {any_lang[0]}"
+                    # 3. Крайний случай: берем любой первый язык и переводим на русский
+                    any_transcript = transcript_list.find_transcript([])
+                    transcript = any_transcript.translate('ru')
+                    language = f"авто-перевод с {any_transcript.language}"
                 except:
                     return None, None
 
@@ -138,52 +137,59 @@ async def get_ai_response(model_id, messages):
         )
         return response.choices[0].message.content
     except Exception as e:
-        return f"❌ Ошибка ИИ: {str(e)[:100]}"
+        return f"❌ Ошибка API: {str(e)[:100]}"
 
 async def summarize_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
-    status_msg = await update.message.reply_text("🔍 Анализирую...")
-    is_yt = "youtube.com" in url or "youtu.be" in url
+    status_msg = await update.message.reply_text("🔍 *Анализирую контент...*", parse_mode=ParseMode.MARKDOWN)
     
+    is_yt = "youtube.com" in url or "youtu.be" in url
     if is_yt:
         text, lang = extract_youtube_transcript(url)
     else:
         text, lang = await extract_text_from_url(url), "веб-страница"
 
     if not text:
-        await status_msg.edit_text("❌ Не удалось получить текст. Возможно, нет субтитров или доступ закрыт.")
+        await status_msg.edit_text("❌ Не удалось извлечь текст. Проверьте, есть ли в видео субтитры.")
         return
 
     model_id = MODEL_IDS.get(context.user_data.get('model', 'gemini'))
-    prompt = f"Сделай краткое содержание текста (источник: {lang}). Выдели 3-5 главных мыслей.\n\nТекст: {text}"
+    prompt = f"Сделай краткий пересказ текста (источник: {lang}). Выдели основные тезисы.\n\nТекст: {text}"
     
     answer = await get_ai_response(model_id, [{"role": "user", "content": prompt}])
     await status_msg.delete()
-    await update.message.reply_text(f"📝 *Результат анализа:* \n\n{answer}", parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(f"📝 *Краткое содержание ({lang}):*\n\n{answer}", parse_mode=ParseMode.MARKDOWN)
 
 # ===== ОБРАБОТЧИКИ =====
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 Бот Meridian готов к работе!", reply_markup=get_main_menu())
+    await update.message.reply_text(
+        "👋 Привет! Я твой AI-помощник.\nИспользуй кнопки внизу, чтобы управлять мной.",
+        reply_markup=get_main_menu()
+    )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     user_id = update.effective_user.id
     
     if text == "🤖 Модели":
-        await update.message.reply_text("Выбери модель:", reply_markup=ReplyKeyboardMarkup([list(MODEL_IDS.keys())[:3], list(MODEL_IDS.keys())[3:], ["🔙 Назад"]], resize_keyboard=True))
+        btns = [["🤖 Gemini", "🧠 GPT-4o"], ["🎭 Claude", "💚 GPT-mini"], ["🦙 Llama", "🐋 DeepSeek"], ["🔙 Назад"]]
+        await update.message.reply_text("Выберите модель:", reply_markup=ReplyKeyboardMarkup(btns, resize_keyboard=True))
         return
+
     if text == "🗑️ Очистить":
         user_chats[user_id] = []
-        await update.message.reply_text("🧹 Очищено!")
+        await update.message.reply_text("🧹 История диалога очищена.")
         return
+
     if text == "🔙 Назад":
         await start(update, context)
         return
-    
-    # Смена модели
-    if text in MODEL_IDS:
-        context.user_data['model'] = text
-        await update.message.reply_text(f"✅ Модель: {text}", reply_markup=get_main_menu())
+
+    # Обработка выбора модели
+    model_map = {"🤖 Gemini": "gemini", "🧠 GPT-4o": "gpt-4o", "🎭 Claude": "claude", "💚 GPT-mini": "gpt-mini", "🦙 Llama": "llama", "🐋 DeepSeek": "deepseek"}
+    if text in model_map:
+        context.user_data['model'] = model_map[text]
+        await update.message.reply_text(f"✅ Установлена модель: {text}", reply_markup=get_main_menu())
         return
 
     # Анализ ссылок
@@ -192,7 +198,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await summarize_url(update, context, url_match.group())
         return
 
-    # Обычный чат
+    # Обычный диалог
     if user_id not in user_chats: user_chats[user_id] = []
     user_chats[user_id].append({"role": "user", "content": text})
     
@@ -207,7 +213,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_chats[user_id].append({"role": "assistant", "content": answer})
     await update.message.reply_text(answer, parse_mode=ParseMode.MARKDOWN)
 
-# ===== ЗАПУСК =====
+# ===== ЗАПУСК СЕРВЕРА =====
 
 async def main():
     app = Application.builder().token(TOKEN).build()
@@ -222,7 +228,10 @@ async def main():
         await app.update_queue.put(Update.de_json(json_data, app.bot))
         return Response()
     
-    starlette_app = Starlette(routes=[Route("/telegram", telegram_webhook, methods=["POST"]), Route("/healthcheck", lambda _: PlainTextResponse("ok"), methods=["GET"])])
+    starlette_app = Starlette(routes=[
+        Route("/telegram", telegram_webhook, methods=["POST"]),
+        Route("/healthcheck", lambda _: PlainTextResponse("ok"), methods=["GET"])
+    ])
     
     import uvicorn
     config = uvicorn.Config(app=starlette_app, host="0.0.0.0", port=PORT)
