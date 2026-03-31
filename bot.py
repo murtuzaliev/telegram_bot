@@ -18,6 +18,8 @@ from telegram.constants import ParseMode
 
 from openai import OpenAI
 from bs4 import BeautifulSoup
+from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api.formatters import TextFormatter
 
 # Настройка логирования
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -149,8 +151,55 @@ async def get_ai_response(model_id, messages):
         logger.error(f"Ошибка API: {e}")
         return f"❌ Ошибка: {str(e)[:100]}"
 
+def extract_youtube_transcript(url: str) -> tuple:
+    """Извлечение субтитров из YouTube видео. Возвращает (текст, язык)"""
+    try:
+        # Извлекаем ID видео из URL
+        video_id = None
+        if "youtu.be" in url:
+            video_id = url.split("/")[-1].split("?")[0]
+        elif "youtube.com" in url:
+            if "v=" in url:
+                video_id = url.split("v=")[1].split("&")[0]
+            elif "shorts/" in url:
+                video_id = url.split("shorts/")[1].split("?")[0]
+        
+        if not video_id:
+            return None, None
+        
+        # Получаем список доступных транскрипций
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        
+        # Пробуем получить русские субтитры
+        try:
+            transcript = transcript_list.find_transcript(['ru', 'uk'])
+            language = "русский"
+        except:
+            try:
+                transcript = transcript_list.find_transcript(['en'])
+                language = "английский"
+            except:
+                # Если нет, берем любые доступные
+                available = transcript_list._transcripts
+                if available:
+                    transcript = list(available.values())[0]
+                    language = transcript.language
+                else:
+                    return None, None
+        
+        # Форматируем в текст
+        formatter = TextFormatter()
+        text = formatter.format_transcript(transcript.fetch())
+        
+        # Ограничиваем длину
+        return text[:4000], language
+        
+    except Exception as e:
+        logger.error(f"YouTube transcript error: {e}")
+        return None, None
+
 async def extract_text_from_url(url: str) -> str:
-    """Извлечение текста из веб-страницы"""
+    """Извлечение текста из обычной веб-страницы"""
     try:
         async with httpx.AsyncClient(timeout=15.0) as client_http:
             response = await client_http.get(url, follow_redirects=True)
@@ -177,32 +226,84 @@ async def extract_text_from_url(url: str) -> str:
         return None
 
 async def summarize_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
-    """Суммаризация контента по ссылке"""
+    """Суммаризация контента по ссылке (поддержка YouTube)"""
     status_msg = await update.message.reply_text("🔍 *Анализирую ссылку...*", parse_mode=ParseMode.MARKDOWN)
     
-    text = await extract_text_from_url(url)
+    text = None
+    is_youtube = "youtube.com" in url or "youtu.be" in url
+    language = None
+    
+    if is_youtube:
+        await status_msg.edit_text("🎬 *Обнаружено YouTube видео!*\nИзвлекаю субтитры...", parse_mode=ParseMode.MARKDOWN)
+        text, language = extract_youtube_transcript(url)
+        source = "YouTube видео"
+    else:
+        text = await extract_text_from_url(url)
+        source = "веб-страницы"
+    
     if not text:
-        await status_msg.edit_text("❌ Не удалось извлечь текст из ссылки.")
+        if is_youtube:
+            await status_msg.edit_text(
+                "❌ *Не удалось извлечь субтитры из YouTube видео*\n\n"
+                "Возможные причины:\n"
+                "• У видео нет субтитров\n"
+                "• Видео на недоступном языке\n"
+                "• Это короткое видео (Shorts) без субтитров\n\n"
+                "Попробуйте другое видео с субтитрами.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await status_msg.edit_text(
+                "❌ *Не удалось извлечь текст из ссылки*\n\n"
+                "Проверьте, что ссылка открывается и содержит текст.",
+                parse_mode=ParseMode.MARKDOWN
+            )
         return
     
     model_key = context.user_data.get('model', 'gemini')
     model_id = MODEL_IDS.get(model_key)
     
-    prompt = f"""
-    Сделай краткую выжимку из текста. Выдели главные мысли и ключевые факты.
-    
-    Текст:
-    {text}
-    
-    Ответь в формате:
-    📌 *Краткое содержание:*
-    [3-5 предложений]
-    
-    🔑 *Ключевые моменты:*
-    • [пункт 1]
-    • [пункт 2]
-    • [пункт 3]
-    """
+    # Разный промпт для YouTube и обычных ссылок
+    if is_youtube:
+        prompt = f"""
+        Это транскрипция (субтитры) YouTube видео на {language} языке.
+        
+        Сделай краткое содержание видео:
+        1. О чем видео (основная тема)
+        2. Ключевые моменты (3-5 пунктов)
+        3. Главные выводы
+        
+        Транскрипция:
+        {text}
+        
+        Ответь на русском языке в формате:
+        🎬 *О чем видео:*
+        [2-3 предложения]
+        
+        🔑 *Ключевые моменты:*
+        • [пункт 1]
+        • [пункт 2]
+        • [пункт 3]
+        
+        💡 *Выводы:*
+        [1-2 предложения]
+        """
+    else:
+        prompt = f"""
+        Сделай краткую выжимку из следующего текста. Выдели главные мысли и ключевые факты.
+        
+        Текст:
+        {text}
+        
+        Ответь в формате:
+        📌 *Краткое содержание:*
+        [3-5 предложений]
+        
+        🔑 *Ключевые моменты:*
+        • [пункт 1]
+        • [пункт 2]
+        • [пункт 3]
+        """
     
     await status_msg.edit_text("🤔 *Создаю краткое содержание...*", parse_mode=ParseMode.MARKDOWN)
     
@@ -212,7 +313,7 @@ async def summarize_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url:
         await status_msg.delete()
         await update.message.reply_text(answer, parse_mode=ParseMode.MARKDOWN)
     else:
-        await status_msg.edit_text("❌ Не удалось создать краткое содержание.")
+        await status_msg.edit_text("❌ Не удалось создать краткое содержание. Попробуйте позже.")
 
 # ===== ОБРАБОТЧИК МЕНЮ =====
 
@@ -247,7 +348,8 @@ async def handle_menu_commands(update: Update, context: ContextTypes.DEFAULT_TYP
             "Просто напишите: `/image описание`\n\n"
             "Примеры:\n"
             "`/image кот в космосе`\n"
-            "`/image логотип минимализм`",
+            "`/image логотип минимализм`\n"
+            "`/image закат над морем, цифровой арт`",
             parse_mode=ParseMode.MARKDOWN
         )
         return True
@@ -255,7 +357,12 @@ async def handle_menu_commands(update: Update, context: ContextTypes.DEFAULT_TYP
     elif text == "🔗 Анализ ссылки":
         await update.message.reply_text(
             "🔗 *Анализ ссылки*\n\n"
-            "Просто отправьте любую ссылку, и я сделаю краткое содержание!"
+            "Просто отправьте любую ссылку, и я сделаю краткое содержание!\n\n"
+            "Поддерживается:\n"
+            "• YouTube видео (с субтитрами)\n"
+            "• Веб-страницы\n"
+            "• Статьи\n"
+            "• Новости"
         )
         return True
         
@@ -343,7 +450,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Я умею:\n"
         f"📝 Отвечать на вопросы\n"
         f"🎨 Генерировать картинки\n"
-        f"🔗 Анализировать ссылки\n"
+        f"🔗 Анализировать ссылки (включая YouTube!)\n"
         f"📷 Распознавать фото\n"
         f"🎙️ Слышать голос\n\n"
         f"👇 *Используй меню внизу для навигации!*",
@@ -365,11 +472,18 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • Просто отправьте текст - я отвечу
 • Отправьте фото с вопросом - я проанализирую
 • Отправьте голосовое сообщение - я распознаю
-• Отправьте ссылку - я сделаю краткое содержание
+• **Отправьте ссылку на YouTube** - я сделаю краткое содержание видео! 🎬
+• Отправьте любую другую ссылку - я сделаю выжимку
 
 *В группах:*
 • Упомяните меня @{context.bot.username} - я отвечу
 • Иногда я сам вступаю в разговор 🎭
+
+*YouTube возможности:*
+• Извлекаю субтитры из видео
+• Делаю краткое содержание
+• Выделяю ключевые моменты
+• Работает с русскими и английскими субтитрами
     """
     await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
 
@@ -380,7 +494,7 @@ async def generate_image_command(update: Update, context: ContextTypes.DEFAULT_T
     if not context.args:
         await update.message.reply_text(
             "❌ *Ошибка:* напишите описание после команды.\n\n"
-            "Пример:\n`/image красный закат над морем`\n`/image логотип минимализм`",
+            "Пример:\n`/image красный закат над морем`\n`/image логотип минимализм`\n`/image кот в космосе`",
             parse_mode=ParseMode.MARKDOWN
         )
         return
@@ -431,7 +545,7 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         return
     user_last_message[user_id] = current_time
     
-    # Проверяем ссылку
+    # Проверяем ссылку (включая YouTube)
     if update.message.text and re.match(r'https?://[^\s]+', update.message.text):
         url_match = re.search(r'https?://[^\s]+', update.message.text)
         if url_match:
@@ -636,7 +750,7 @@ async def main():
         handle_private_message
     ))
     app.add_handler(MessageHandler(
-        filters.TEXT & filters.ChatType.GROUPS & filters.ChatType.SUPERGROUP,
+        filters.TEXT & (filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP),
         handle_group_message
     ))
     
