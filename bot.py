@@ -5,6 +5,8 @@
   TELEGRAM_TOKEN, OPENROUTER_API_KEY, RENDER_EXTERNAL_URL (webhook), PORT
   USE_POLLING=1 — polling вместо webhook
   YOUTUBE_TRANSCRIPT_PROXY или HTTPS_PROXY — URL прокси (обход блокировки IP на Render/AWS и т.д.)
+  GROUP_SPONTANEOUS_CHANCE — шанс % «влезть» в переписку без обращения (0–100, по умолчанию 15)
+  GROUP_COOLDOWN_SEC — пауза между спонтанными ответами в одном чате (сек., по умолчанию 45)
 """
 from __future__ import annotations
 
@@ -85,6 +87,16 @@ USE_POLLING = os.getenv("USE_POLLING", "").lower() in ("1", "true", "yes")
 YOUTUBE_TRANSCRIPT_PROXY = (os.environ.get("YOUTUBE_TRANSCRIPT_PROXY") or "").strip()
 HTTPS_PROXY_ENV = (os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or "").strip()
 
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip().isdigit():
+        return default
+    return int(str(raw).strip())
+
+
+GROUP_COOLDOWN_SEC = max(5, _env_int("GROUP_COOLDOWN_SEC", 45))
+
 if not TOKEN:
     logger.error("TELEGRAM_TOKEN не установлен!")
 if not OPENROUTER_API_KEY:
@@ -138,16 +150,37 @@ PERSONAS = {
 
 GROUP_CONFIG = {
     "enabled": True,
-    "spontaneous_chance": 15,
+    "spontaneous_chance": max(0, min(100, _env_int("GROUP_SPONTANEOUS_CHANCE", 15))),
     "max_context_messages": 8,
-    "min_message_length": 20,
+    "min_message_length": 12,
 }
+
+# Настройки отдельных чатов (переопределяют GROUP_CONFIG): chat_id -> {"spontaneous_chance": int}
+group_chat_settings: dict = {}
+
+# Антиспам: время последнего ответа бота в чате (только для «спонтанных» ответов)
+group_spontaneous_last_reply: dict = defaultdict(float)
 
 user_chats: dict = {}
 user_last_message = defaultdict(float)
 user_persona: dict = {}
 group_messages = defaultdict(list)
 MAX_HISTORY_LENGTH = 10
+
+# Стиль общения в группах (отдельно от личных «личностей»)
+GROUP_CHAT_SYSTEM_PROMPT = (
+    "Ты — живой участник русскоязычного Telegram-чата. "
+    "Можешь шутить, слегка иронизировать и отвечать с лёгким сарказмом, как с друзьями. "
+    "Без мата, оскорблений, травли, политики и токсичности; не переходи на личности и не унижай людей. "
+    "Пиши по-русски, коротко: обычно 1–3 предложения, можно эмодзи. "
+    "Если тебя упомянули или ответили на твоё сообщение — отвечай по делу, но в том же живом стиле."
+)
+
+
+def get_group_spontaneous_chance(chat_id: int) -> int:
+    if chat_id in group_chat_settings and "spontaneous_chance" in group_chat_settings[chat_id]:
+        return max(0, min(100, int(group_chat_settings[chat_id]["spontaneous_chance"])))
+    return GROUP_CONFIG["spontaneous_chance"]
 
 client = OpenAI(api_key=OPENROUTER_API_KEY, base_url=OPENROUTER_BASE_URL)
 
@@ -267,9 +300,24 @@ def _proxy_help_message() -> str:
         "YouTube *блокирует* запросы с IP вашего сервера (типично для облака: Render, Railway, AWS). "
         "Это *не* значит, что у видео нет субтитров.\n\n"
         "*Решение:* в настройках сервиса задайте переменную `YOUTUBE_TRANSCRIPT_PROXY` "
-        "(или `HTTPS_PROXY`) — URL резидентского/мобильного прокси и перезапустите бота.\n"
+        "(или `HTTPS_PROXY`) — URL *резидентского или мобильного* прокси (обычно платный) и перезапустите сервис.\n"
+        "Бесплатные «общие» прокси часто не подходят.\n"
+        "Альтернатива без прокси: запускать бота у себя на ПК (домашний IP) или на VPS с «чистым» IP.\n"
         "Подробнее: README пакета youtube-transcript-api, раздел про IP bans."
     )
+
+
+def _youtube_error_is_datacenter_ip_block(error_msg: str) -> bool:
+    """True, если проблема в блокировке IP, а не в отсутствии субтитров."""
+    if not error_msg:
+        return False
+    markers = (
+        "YOUTUBE_TRANSCRIPT_PROXY",
+        "блокирует запросы с IP",
+        "HTTPS_PROXY",
+        "резидентского",
+    )
+    return any(m in error_msg for m in markers)
 
 
 def _fetched_to_text(fetched) -> str:
@@ -505,10 +553,15 @@ async def summarize_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url:
         text, language, error_msg = await asyncio.to_thread(extract_youtube_transcript, url)
 
         if error_msg:
+            if _youtube_error_is_datacenter_ip_block(error_msg):
+                tip = (
+                    "💡 *Важно:* пока запросы идут с IP облака, *другая ссылка на YouTube не поможет* — "
+                    "нужен прокси, другой хостинг или запуск бота с домашнего IP."
+                )
+            else:
+                tip = "💡 *Совет:* попробуйте видео, у которого точно есть субтитры, или проверьте ссылку."
             await status_msg.edit_text(
-                f"❌ *Не удалось извлечь субтитры*\n\n"
-                f"{error_msg}\n\n"
-                f"💡 *Совет:* попробуйте другое видео с субтитрами или проверьте ссылку.",
+                f"❌ *Не удалось извлечь субтитры*\n\n{error_msg}\n\n{tip}",
                 parse_mode=ParseMode.MARKDOWN,
             )
             return
@@ -708,7 +761,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"🔗 Анализировать ссылки (включая YouTube!)\n"
         f"📷 Распознавать фото\n"
         f"🎙️ Слышать голос\n"
-        f"👥 *В группах:* упомяните меня @{bot_username} или ответьте на моё сообщение\n\n"
+        f"👥 *В группах:* добавьте меня в чат, упомяните @{bot_username}, ответьте на моё сообщение "
+        f"или дождитесь спонтанной реплики (см. `/grouphelp` в группе).\n\n"
         f"👇 *Используй меню внизу для навигации!*",
         reply_markup=get_main_menu(),
         parse_mode=ParseMode.MARKDOWN,
@@ -732,9 +786,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 • **Отправьте ссылку** — краткое содержание (страница или YouTube)
 
 *В группах:*
-• Упомяните меня @{bot_username}
-• Ответьте на моё сообщение
-• Иногда отвечаю сам (~{GROUP_CONFIG['spontaneous_chance']}% шанс)
+• Упомяните меня @{bot_username} или ответьте на моё сообщение
+• Иногда вступаю в разговор сам (шанс настраивается: `/grouphelp`)
+• Команда `/grouphelp` — как включить «видеть все сообщения» (BotFather)
 
 *YouTube:* субтитры (ручные и авто), при необходимости перевод EN→RU
     """
@@ -777,6 +831,60 @@ async def generate_image_command(update: Update, context: ContextTypes.DEFAULT_T
     except Exception as e:
         logger.error("Image Gen Error: %s", e)
         await status_msg.edit_text(f"❌ Ошибка: {str(e)[:100]}")
+
+
+# ----- Группы: команды -----
+async def group_help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Справка по работе бота в группах."""
+    if not update.effective_chat or update.effective_chat.type not in ("group", "supergroup"):
+        return
+    bot_username = (await context.bot.get_me()).username
+    chance = get_group_spontaneous_chance(update.effective_chat.id)
+    await update.message.reply_text(
+        f"👥 *Бот в группе*\n\n"
+        f"• Ответы на @{bot_username} и на ответы мне — всегда (если не молчу из сбоя API).\n"
+        f"• *Спонтанные* реплики: сейчас шанс *{chance}%* на сообщение длиннее "
+        f"{GROUP_CONFIG['min_message_length']} симв. (антиспам: не чаще чем раз в *{GROUP_COOLDOWN_SEC}* сек в этом чате).\n"
+        f"• Админы: `/groupchance 0` … `100` — сменить шанс для этого чата.\n\n"
+        f"*Чтобы я видел обычную переписку* (а не только команды и упоминания), "
+        f"в @BotFather → Bot Settings → Group Privacy → *Turn off* (Disable privacy mode). "
+        f"Иначе я получаю мало сообщений — спонтанные ответы почти не сработают.\n\n"
+        f"Стиль в группе: шутки и лёгкий сарказм, без токсичности.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def group_chance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Только админы: задать шанс спонтанного ответа 0–100 для текущего чата."""
+    if not update.effective_chat or update.effective_chat.type not in ("group", "supergroup"):
+        return
+    chat = update.effective_chat
+    user = update.effective_user
+    member = await context.bot.get_chat_member(chat.id, user.id)
+    if member.status not in ("administrator", "creator"):
+        await update.message.reply_text("⛔ Команду могут использовать только администраторы или владелец чата.")
+        return
+
+    if not context.args:
+        c = get_group_spontaneous_chance(chat.id)
+        await update.message.reply_text(
+            f"Текущий шанс спонтанного ответа в этом чате: *{c}%*\n"
+            f"Изменить: `/groupchance 20` (число от 0 до 100).",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    try:
+        n = int(context.args[0].strip())
+    except ValueError:
+        await update.message.reply_text("Укажите число от 0 до 100, например: `/groupchance 25`")
+        return
+
+    n = max(0, min(100, n))
+    if chat.id not in group_chat_settings:
+        group_chat_settings[chat.id] = {}
+    group_chat_settings[chat.id]["spontaneous_chance"] = n
+    await update.message.reply_text(f"✅ Для этого чата шанс спонтанных ответов: *{n}%*", parse_mode=ParseMode.MARKDOWN)
 
 
 # ----- Личные сообщения -----
@@ -889,6 +997,9 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
 
 # ----- Группы -----
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not GROUP_CONFIG.get("enabled", True):
+        return
+
     message = update.message
     chat_id = message.chat_id
 
@@ -926,12 +1037,15 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     ):
         should_reply = True
         reply_type = "reply"
-    elif (
-        len(text) >= GROUP_CONFIG["min_message_length"]
-        and random.randint(1, 100) <= GROUP_CONFIG["spontaneous_chance"]
-    ):
-        should_reply = True
-        reply_type = "spontaneous"
+    elif len(text) >= GROUP_CONFIG["min_message_length"]:
+        chance = get_group_spontaneous_chance(chat_id)
+        if chance <= 0:
+            pass
+        elif time.time() - group_spontaneous_last_reply[chat_id] < GROUP_COOLDOWN_SEC:
+            pass
+        elif random.randint(1, 100) <= chance:
+            should_reply = True
+            reply_type = "spontaneous"
 
     if not should_reply:
         return
@@ -947,41 +1061,39 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     context_text = "\n".join(context_lines)
 
     prompts = {
-        "mention": f"""Ты участник чата в Telegram. Тебя упомянули.
-Ответь весело и коротко (1-2 предложения), можно с эмодзи.
+        "mention": f"""Тебя вызвали по @{bot_username}. Посмотри последние реплики и ответь по смыслу.
+Можно подколоть с юмором, но без грубости.
 
-Контекст:
+Последние сообщения:
 {context_text}
 
-Твой ответ (только ответ):""",
-        "reply": f"""Ты участник чата. Тебе ответили.
-Будь дружелюбным, коротко (1-2 предложения).
+Только твой ответ, без пояснений:""",
+        "reply": f"""Тебе ответили на твоё сообщение. Отреагируй по контексту — живо, с иронией или тепло, по ситуации.
 
-Контекст:
+Переписка:
 {context_text}
 
-Твой ответ:""",
-        "spontaneous": f"""Ты участник чата. Люди что-то обсуждают.
-Напиши короткий комментарий, шутку или вопрос по теме (1-2 предложения).
+Только твой ответ:""",
+        "spontaneous": f"""Ты сам решил вставить реплику в разговор (никто тебя не тегал).
+Коротко подшути, поддай идею или тонко прокомментируй тему — как свой в чате.
 
-Контекст:
+Переписка:
 {context_text}
 
-Твой ответ:""",
+Только твой ответ (1–3 предложения):""",
     }
 
     prompt = prompts.get(reply_type, prompts["mention"])
     model_key = context.user_data.get("model", "gemini") if context.user_data else "gemini"
     model_id = MODEL_IDS.get(model_key, MODEL_IDS["gemini"])
-    user_id = message.from_user.id if message.from_user else 0
-    persona_key = user_persona.get(user_id, "default")
-    persona_prompt = PERSONAS[persona_key]["prompt"]
 
     answer = await get_ai_response(
         model_id,
-        [{"role": "system", "content": persona_prompt}, {"role": "user", "content": prompt}],
+        [{"role": "system", "content": GROUP_CHAT_SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
     )
     if answer:
+        if reply_type == "spontaneous":
+            group_spontaneous_last_reply[chat_id] = time.time()
         await message.reply_text(answer[:4096])
 
 
@@ -995,6 +1107,8 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("image", generate_image_command))
+    app.add_handler(CommandHandler("grouphelp", group_help_command, filters=filters.ChatType.GROUPS))
+    app.add_handler(CommandHandler("groupchance", group_chance_command, filters=filters.ChatType.GROUPS))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, handle_private_message))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, handle_group_message))
     return app
