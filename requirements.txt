@@ -1,5 +1,6 @@
-python-telegram-bot
-starlette
-uvicorn
-openai
-httpx
+python-telegram-bot==20.7
+starlette==0.36.3
+uvicorn[standard]==0.27.1
+openai==1.12.0
+httpx==0.27.0
+python-multipart==0.0.9
