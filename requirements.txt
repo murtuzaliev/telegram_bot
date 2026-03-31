@@ -7,3 +7,4 @@ python-multipart==0.0.9
 beautifulsoup4==4.12.3
 youtube-transcript-api==0.6.2
 beautifulsoup4
+youtube-transcript-api
