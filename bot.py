@@ -765,7 +765,4 @@ async def generate_image_command(update: Update, context: ContextTypes.DEFAULT_T
 
     prompt = " ".join(context.args)
     status_msg = await update.message.reply_text(
-        f"⏳ *Генерирую:* `{prompt}`...",
-        parse_mode=ParseMode.MARKDOWN
-    )
-    await context.bot.send_chat_action(chat_id=chat_id, action="upload_photo")
+        f"
